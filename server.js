@@ -1,7 +1,66 @@
 const express = require('express');
+const https = require('https');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
+
+// Cached DDoS-Guard cookies for animepahe (refreshed when expired)
+let paheCookies = '';
+let paheCookiesTime = 0;
+const COOKIE_TTL = 25 * 60 * 1000; // 25 min
+
+async function refreshPaheCookies() {
+    if (paheCookies && Date.now() - paheCookiesTime < COOKIE_TTL) return paheCookies;
+    console.log('[COOKIES] Refreshing animepahe cookies via Puppeteer');
+    const br = await getBrowser();
+    const page = await br.newPage();
+    try {
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 2000));
+        const cookies = await page.cookies();
+        paheCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+        paheCookiesTime = Date.now();
+        console.log(`[COOKIES] Got ${cookies.length} cookies`);
+        return paheCookies;
+    } finally {
+        await page.close().catch(() => {});
+    }
+}
+
+// Plain HTTPS fetch with cookies (no Puppeteer overhead)
+function httpsFetch(url, cookies) {
+    return new Promise((resolve, reject) => {
+        const req = https.get(url, {
+            headers: {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                'Accept': 'application/json',
+                'Cookie': cookies,
+                'Referer': 'https://animepahe.pw/',
+            },
+            timeout: 10000,
+        }, (res) => {
+            let body = '';
+            res.on('data', (chunk) => body += chunk);
+            res.on('end', () => resolve({ status: res.statusCode, body }));
+        });
+        req.on('error', reject);
+        req.on('timeout', () => { req.destroy(); reject(new Error('timeout')); });
+    });
+}
+
+async function paheApiCall(path) {
+    let cookies = await refreshPaheCookies();
+    let result = await httpsFetch(`https://animepahe.pw${path}`, cookies);
+    // If forbidden, refresh cookies and retry once
+    if (result.status === 403 || result.body.includes('DDoS-Guard')) {
+        console.log('[RETRY] Got DDoS-Guard, refreshing cookies');
+        paheCookies = '';
+        cookies = await refreshPaheCookies();
+        result = await httpsFetch(`https://animepahe.pw${path}`, cookies);
+    }
+    return result.body;
+}
 
 const app = express();
 const PORT = process.env.PORT || 3232;
@@ -247,59 +306,34 @@ async function extractVideoUrl(watchUrl) {
     }
 }
 
-// Search animepahe and return matching anime
+// Search animepahe (uses cached cookies, no Puppeteer per request)
 app.get('/animepahe/search', async (req, res) => {
     const query = req.query.q;
     if (!query) return res.status(400).json({ error: 'Missing q parameter' });
     try {
-        const br = await getBrowser();
-        const page = await br.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-        // Navigate to homepage first to solve DDoS-Guard
-        console.log(`[PAHE] Loading homepage to solve DDoS-Guard`);
-        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 3000));
-        // Now call the search API
-        console.log(`[PAHE] Searching: ${query}`);
-        const result = await page.evaluate(async (q) => {
-            const r = await fetch('/api?m=search&q=' + encodeURIComponent(q), {
-                headers: { 'Accept': 'application/json' }
-            });
-            return await r.text();
-        }, query);
-        await page.close();
+        console.log(`[PAHE] Search: ${query}`);
+        const body = await paheApiCall(`/api?m=search&q=${encodeURIComponent(query)}`);
         try {
-            const json = JSON.parse(result);
-            res.json({ status: 'ok', data: json });
+            res.json({ status: 'ok', data: JSON.parse(body) });
         } catch (e) {
-            res.json({ status: 'error', error: 'Got HTML instead of JSON', preview: result.substring(0, 200) });
+            res.json({ status: 'error', error: 'Got HTML', preview: body.substring(0, 200) });
         }
     } catch (e) {
         res.status(500).json({ status: 'error', error: e.message });
     }
 });
 
-// Get episodes for an anime session
+// Get episodes (uses cached cookies)
 app.get('/animepahe/episodes', async (req, res) => {
     const session = req.query.session;
     if (!session) return res.status(400).json({ error: 'Missing session parameter' });
     try {
-        const br = await getBrowser();
-        const page = await br.newPage();
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 3000));
-        const result = await page.evaluate(async (s) => {
-            const r = await fetch('/api?m=release&id=' + s + '&sort=episode_asc&page=1', {
-                headers: { 'Accept': 'application/json' }
-            });
-            return await r.text();
-        }, session);
-        await page.close();
+        console.log(`[PAHE] Episodes: ${session}`);
+        const body = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=1`);
         try {
-            res.json({ status: 'ok', data: JSON.parse(result) });
+            res.json({ status: 'ok', data: JSON.parse(body) });
         } catch (e) {
-            res.json({ status: 'error', error: 'Got HTML', preview: result.substring(0, 200) });
+            res.json({ status: 'error', error: 'Got HTML', preview: body.substring(0, 200) });
         }
     } catch (e) {
         res.status(500).json({ status: 'error', error: e.message });
@@ -334,20 +368,18 @@ app.get('/animepahe/video', async (req, res) => {
         });
 
         const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
-        console.log(`[PAHE] Loading play page: ${playUrl}`);
-        await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 });
-        await new Promise(r => setTimeout(r, 5000));
+        console.log(`[PAHE] Play: ${playUrl}`);
+        await page.goto(playUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
+        await new Promise(r => setTimeout(r, 1500));
 
         // Extract Kwik link from page
         const kwikUrl = await page.evaluate(() => {
-            // Look for the resolution dropdown which has the kwik data-src
             const btn = document.querySelector('#resolutionMenu button[data-src], button.dropdown-item[data-src]');
             return btn ? btn.getAttribute('data-src') : '';
         }).catch(() => '');
 
         if (kwikUrl) {
-            console.log(`[PAHE KWIK] ${kwikUrl}`);
-            // Open kwik page
+            console.log(`[KWIK] ${kwikUrl}`);
             const kwikPage = await br.newPage();
             await kwikPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
             await kwikPage.setExtraHTTPHeaders({ 'Referer': 'https://animepahe.pw/' });
@@ -356,11 +388,16 @@ app.get('/animepahe/video', async (req, res) => {
             await kwikClient.send('Network.enable');
             kwikClient.on('Network.requestWillBeSent', (params) => {
                 const u = params.request.url;
-                if (!videoUrl && u.includes('.m3u8')) { console.log(`[KWIK HLS] ${u}`); videoUrl = u; }
-                if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) { console.log(`[KWIK MP4] ${u}`); videoUrl = u; }
+                if (!videoUrl && u.includes('.m3u8')) { console.log(`[HLS] ${u}`); videoUrl = u; }
+                if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) { console.log(`[MP4] ${u}`); videoUrl = u; }
             });
-            await kwikPage.goto(kwikUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-            await new Promise(r => setTimeout(r, 5000));
+            await kwikPage.goto(kwikUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+
+            // Poll for the video URL instead of fixed wait
+            const start = Date.now();
+            while (!videoUrl && Date.now() - start < 8000) {
+                await new Promise(r => setTimeout(r, 200));
+            }
 
             if (!videoUrl) {
                 const src = await kwikPage.evaluate(() => {

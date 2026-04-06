@@ -108,7 +108,7 @@ async function extractVideoUrl(watchUrl) {
 
         // Wait for the server to auto-select and video to start loading
         // The page's JS will auto-play the first server
-        await page.waitForTimeout(3000);
+        await new Promise(r => setTimeout(r,3000));
 
         // If no video URL intercepted yet, try to get it from JWPlayer inside the iframe
         if (!videoUrl) {
@@ -168,7 +168,7 @@ async function extractVideoUrl(watchUrl) {
         // Last resort: wait longer and check network
         if (!videoUrl) {
             console.log('[WAITING] No video found yet, waiting 10 more seconds...');
-            await page.waitForTimeout(10000);
+            await new Promise(r => setTimeout(r,10000));
         }
 
         if (videoUrl) {

@@ -247,6 +247,147 @@ async function extractVideoUrl(watchUrl) {
     }
 }
 
+// Search animepahe and return matching anime
+app.get('/animepahe/search', async (req, res) => {
+    const query = req.query.q;
+    if (!query) return res.status(400).json({ error: 'Missing q parameter' });
+    try {
+        const br = await getBrowser();
+        const page = await br.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        // Navigate to homepage first to solve DDoS-Guard
+        console.log(`[PAHE] Loading homepage to solve DDoS-Guard`);
+        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 3000));
+        // Now call the search API
+        console.log(`[PAHE] Searching: ${query}`);
+        const result = await page.evaluate(async (q) => {
+            const r = await fetch('/api?m=search&q=' + encodeURIComponent(q), {
+                headers: { 'Accept': 'application/json' }
+            });
+            return await r.text();
+        }, query);
+        await page.close();
+        try {
+            const json = JSON.parse(result);
+            res.json({ status: 'ok', data: json });
+        } catch (e) {
+            res.json({ status: 'error', error: 'Got HTML instead of JSON', preview: result.substring(0, 200) });
+        }
+    } catch (e) {
+        res.status(500).json({ status: 'error', error: e.message });
+    }
+});
+
+// Get episodes for an anime session
+app.get('/animepahe/episodes', async (req, res) => {
+    const session = req.query.session;
+    if (!session) return res.status(400).json({ error: 'Missing session parameter' });
+    try {
+        const br = await getBrowser();
+        const page = await br.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 3000));
+        const result = await page.evaluate(async (s) => {
+            const r = await fetch('/api?m=release&id=' + s + '&sort=episode_asc&page=1', {
+                headers: { 'Accept': 'application/json' }
+            });
+            return await r.text();
+        }, session);
+        await page.close();
+        try {
+            res.json({ status: 'ok', data: JSON.parse(result) });
+        } catch (e) {
+            res.json({ status: 'error', error: 'Got HTML', preview: result.substring(0, 200) });
+        }
+    } catch (e) {
+        res.status(500).json({ status: 'error', error: e.message });
+    }
+});
+
+// Extract video URL from animepahe play page (Kwik embed)
+app.get('/animepahe/video', async (req, res) => {
+    const session = req.query.session;
+    const epSession = req.query.ep;
+    if (!session || !epSession) return res.status(400).json({ error: 'Missing session/ep' });
+    try {
+        const br = await getBrowser();
+        const page = await br.newPage();
+        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+
+        let videoUrl = '';
+        const allUrls = [];
+        const client = await page.target().createCDPSession();
+        await client.send('Network.enable');
+        client.on('Network.requestWillBeSent', (params) => {
+            const u = params.request.url;
+            allUrls.push(u);
+            if (!videoUrl && u.includes('.m3u8')) {
+                console.log(`[PAHE HLS] ${u}`);
+                videoUrl = u;
+            }
+            if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) {
+                console.log(`[PAHE MP4] ${u}`);
+                videoUrl = u;
+            }
+        });
+
+        const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
+        console.log(`[PAHE] Loading play page: ${playUrl}`);
+        await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 });
+        await new Promise(r => setTimeout(r, 5000));
+
+        // Extract Kwik link from page
+        const kwikUrl = await page.evaluate(() => {
+            // Look for the resolution dropdown which has the kwik data-src
+            const btn = document.querySelector('#resolutionMenu button[data-src], button.dropdown-item[data-src]');
+            return btn ? btn.getAttribute('data-src') : '';
+        }).catch(() => '');
+
+        if (kwikUrl) {
+            console.log(`[PAHE KWIK] ${kwikUrl}`);
+            // Open kwik page
+            const kwikPage = await br.newPage();
+            await kwikPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+            await kwikPage.setExtraHTTPHeaders({ 'Referer': 'https://animepahe.pw/' });
+
+            const kwikClient = await kwikPage.target().createCDPSession();
+            await kwikClient.send('Network.enable');
+            kwikClient.on('Network.requestWillBeSent', (params) => {
+                const u = params.request.url;
+                if (!videoUrl && u.includes('.m3u8')) { console.log(`[KWIK HLS] ${u}`); videoUrl = u; }
+                if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) { console.log(`[KWIK MP4] ${u}`); videoUrl = u; }
+            });
+            await kwikPage.goto(kwikUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+            await new Promise(r => setTimeout(r, 5000));
+
+            if (!videoUrl) {
+                const src = await kwikPage.evaluate(() => {
+                    const v = document.querySelector('video');
+                    if (v) return v.src || v.currentSrc || '';
+                    return '';
+                }).catch(() => '');
+                if (src) videoUrl = src;
+            }
+            await kwikPage.close().catch(() => {});
+        }
+
+        await page.close().catch(() => {});
+
+        if (videoUrl) {
+            res.json({ status: 'ok', videoUrl, kwikUrl });
+        } else {
+            console.log('[PAHE] All URLs:');
+            allUrls.filter(u => !u.match(/\.(css|js|png|jpg|svg|woff|gif|ico)/)).slice(-20).forEach(u => console.log('  ' + u));
+            res.status(404).json({ status: 'error', error: 'No video URL found', kwikUrl });
+        }
+    } catch (e) {
+        console.error(`[PAHE ERROR] ${e.message}`);
+        res.status(500).json({ status: 'error', error: e.message });
+    }
+});
+
 app.get('/extract', async (req, res) => {
     const url = req.query.url;
     if (!url) return res.status(400).json({ error: 'Missing url parameter' });

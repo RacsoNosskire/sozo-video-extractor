@@ -66,16 +66,22 @@ async function extractVideoUrl(watchUrl) {
         );
 
         let videoUrl = '';
+        let megaupEmbedUrl = '';
         let subtitles = [];
         const allUrls = [];
 
-        // Use CDP to capture ALL network requests including from sub-frames
         const client = await page.target().createCDPSession();
         await client.send('Network.enable');
 
         client.on('Network.requestWillBeSent', (params) => {
             const url = params.request.url;
             allUrls.push(url);
+
+            // Capture megaup embed URL from network
+            if (!megaupEmbedUrl && url.includes('megaup.nl/e/')) {
+                console.log(`[MEGAUP URL] ${url}`);
+                megaupEmbedUrl = url;
+            }
 
             if (!videoUrl) {
                 if (url.includes('.m3u8')) {
@@ -113,14 +119,11 @@ async function extractVideoUrl(watchUrl) {
         // Wait for megaup iframe and navigate to it directly to force load
         await new Promise(r => setTimeout(r, 5000));
 
-        // Find megaup iframe URL and visit it directly
+        // Use megaup URL captured from network requests
         try {
-            const megaupUrl = await page.evaluate(() => {
-                const iframe = document.querySelector('iframe[src*="megaup"]');
-                return iframe ? iframe.src : '';
-            });
+            const megaupUrl = megaupEmbedUrl;
             if (megaupUrl) {
-                console.log(`[MEGAUP] Found iframe: ${megaupUrl}`);
+                console.log(`[MEGAUP] Loading: ${megaupUrl}`);
                 // Visit the megaup page directly in a new tab to bypass iframe restrictions
                 const megaupPage = await br.newPage();
                 await megaupPage.setUserAgent(

@@ -1,0 +1,17 @@
+services:
+  sozo-extractor:
+    build: .
+    container_name: sozo-video-extractor
+    restart: unless-stopped
+    ports:
+      - "3232:3232"
+    environment:
+      - PORT=3232
+      - NODE_ENV=production
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+        reservations:
+          memory: 512M
+    shm_size: '256m'

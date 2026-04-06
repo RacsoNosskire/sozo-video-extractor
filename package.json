@@ -1,0 +1,13 @@
+{
+  "name": "sozo-video-extractor",
+  "version": "1.0.0",
+  "description": "Extracts video URLs from anime streaming sites for Sozo TV",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "puppeteer": "^22.0.0"
+  }
+}

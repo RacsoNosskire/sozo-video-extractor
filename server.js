@@ -4,7 +4,6 @@ const puppeteer = require('puppeteer');
 const app = express();
 const PORT = process.env.PORT || 3232;
 
-// Cache extracted URLs for 30 minutes
 const cache = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
 
@@ -19,7 +18,6 @@ function setCache(key, value) {
     cache.set(key, { value, time: Date.now() });
 }
 
-// Clean old cache entries every 10 minutes
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of cache) {
@@ -38,10 +36,10 @@ async function getBrowser() {
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
+                '--disable-web-security',
+                '--disable-features=IsolateOrigins,site-per-process',
                 '--no-first-run',
                 '--no-zygote',
-                '--single-process',
-                '--disable-extensions',
                 '--autoplay-policy=no-user-gesture-required',
             ],
         });
@@ -49,12 +47,6 @@ async function getBrowser() {
     return browser;
 }
 
-/**
- * Extract video URL from anigo.to or anikai.to watch page
- * The page loads a megaup.nl embed which fetches /media/ endpoint
- * that returns an encrypted token. The client JS decrypts it into a video URL.
- * We intercept the actual video request after decryption.
- */
 async function extractVideoUrl(watchUrl) {
     const cached = getCached(watchUrl);
     if (cached) {
@@ -71,104 +63,100 @@ async function extractVideoUrl(watchUrl) {
             'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
         );
 
-        // Collect video-related URLs from network requests
         let videoUrl = '';
         let subtitles = [];
+        const allUrls = [];
 
-        page.on('request', (req) => {
-            const url = req.url();
-            // Catch HLS manifest
-            if (url.includes('.m3u8')) {
-                console.log(`[HLS] ${url}`);
-                if (!videoUrl) videoUrl = url;
-            }
-            // Catch MP4 direct
-            if (url.includes('.mp4') && !url.includes('thumb') && !url.includes('poster')) {
-                console.log(`[MP4] ${url}`);
-                if (!videoUrl) videoUrl = url;
+        // Use CDP to capture ALL network requests including from sub-frames
+        const client = await page.target().createCDPSession();
+        await client.send('Network.enable');
+
+        client.on('Network.requestWillBeSent', (params) => {
+            const url = params.request.url;
+            allUrls.push(url);
+
+            if (!videoUrl) {
+                if (url.includes('.m3u8')) {
+                    console.log(`[HLS] ${url}`);
+                    videoUrl = url;
+                } else if (url.match(/\.mp4(\?|$)/) && !url.includes('thumb') && !url.includes('poster')) {
+                    console.log(`[MP4] ${url}`);
+                    videoUrl = url;
+                }
             }
         });
 
-        page.on('response', async (res) => {
-            const url = res.url();
-            // Catch the /media/ endpoint response and look for video source
-            if (url.includes('/media/')) {
-                try {
-                    const json = await res.json();
-                    console.log(`[MEDIA] status=${json.status} result=${String(json.result).substring(0, 50)}...`);
-                } catch (e) {}
-            }
-            // Catch subtitle files
+        // Also capture response bodies for endpoints that may contain video URLs
+        client.on('Network.responseReceived', async (params) => {
+            const url = params.response.url;
             if (url.includes('.vtt') && !url.includes('thumbnail')) {
                 subtitles.push(url);
             }
         });
 
-        await page.goto(watchUrl, { waitUntil: 'networkidle2', timeout: 20000 });
+        await page.goto(watchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
 
-        // Wait for the server to auto-select and video to start loading
-        // The page's JS will auto-play the first server
-        await new Promise(r => setTimeout(r,3000));
+        // Wait for the SPA to load and auto-play the video
+        await new Promise(r => setTimeout(r, 5000));
 
-        // If no video URL intercepted yet, try to get it from JWPlayer inside the iframe
+        // Try to click the first server if not already clicked
+        try {
+            await page.evaluate(() => {
+                const server = document.querySelector('#servers a.active') || document.querySelector('#servers a');
+                if (server) server.click();
+            });
+        } catch (e) {}
+
+        // Wait longer for the video to load
+        await new Promise(r => setTimeout(r, 8000));
+
+        // If still no video URL, try to extract from JWPlayer or video element in any frame
         if (!videoUrl) {
-            try {
-                // Find the megaup iframe
-                const frames = page.frames();
-                for (const frame of frames) {
-                    if (frame.url().includes('megaup')) {
-                        console.log(`[FRAME] Found megaup frame: ${frame.url()}`);
-                        // Wait for JWPlayer to initialize
-                        const src = await frame.evaluate(() => {
-                            return new Promise((resolve) => {
-                                let attempts = 0;
-                                const poll = setInterval(() => {
-                                    attempts++;
-                                    if (attempts > 20) { clearInterval(poll); resolve(''); return; }
-                                    // Check JWPlayer
-                                    if (typeof jwplayer !== 'undefined') {
-                                        const p = jwplayer();
-                                        if (p && p.getPlaylistItem) {
-                                            const item = p.getPlaylistItem();
-                                            if (item && item.file) {
-                                                clearInterval(poll);
-                                                resolve(item.file);
-                                                return;
-                                            }
-                                        }
+            console.log('[POLL] Checking frames for video...');
+            for (const frame of page.frames()) {
+                try {
+                    const src = await frame.evaluate(() => {
+                        // Try JWPlayer
+                        if (typeof jwplayer !== 'undefined') {
+                            try {
+                                const p = jwplayer();
+                                if (p && p.getPlaylistItem) {
+                                    const item = p.getPlaylistItem();
+                                    if (item && item.file) return item.file;
+                                    if (item && item.sources && item.sources[0]) {
+                                        return item.sources[0].file || item.sources[0].src;
                                     }
-                                    // Check video element
-                                    const video = document.querySelector('video');
-                                    if (video && video.src && video.src.startsWith('http')) {
-                                        clearInterval(poll);
-                                        resolve(video.src);
-                                        return;
-                                    }
-                                    if (video && video.currentSrc && video.currentSrc.startsWith('http')) {
-                                        clearInterval(poll);
-                                        resolve(video.currentSrc);
-                                        return;
-                                    }
-                                }, 500);
-                            });
-                        }).catch(() => '');
-
-                        if (src) {
-                            console.log(`[JWPLAYER] ${src}`);
-                            videoUrl = src;
+                                }
+                                if (p && p.getPlaylist) {
+                                    const pl = p.getPlaylist();
+                                    if (pl && pl[0] && pl[0].file) return pl[0].file;
+                                }
+                            } catch (e) {}
                         }
+                        // Try video element
+                        const video = document.querySelector('video');
+                        if (video) {
+                            if (video.src && video.src.startsWith('http')) return video.src;
+                            if (video.currentSrc && video.currentSrc.startsWith('http')) return video.currentSrc;
+                            const source = video.querySelector('source[src]');
+                            if (source && source.src) return source.src;
+                        }
+                        return '';
+                    }).catch(() => '');
+
+                    if (src) {
+                        console.log(`[FRAME] Found video in ${frame.url()}: ${src}`);
+                        videoUrl = src;
                         break;
                     }
-                }
-            } catch (e) {
-                console.log(`[FRAME ERROR] ${e.message}`);
+                } catch (e) {}
             }
         }
 
-        // Last resort: wait longer and check network
+        // If still nothing, wait more
         if (!videoUrl) {
-            console.log('[WAITING] No video found yet, waiting 10 more seconds...');
-            await new Promise(r => setTimeout(r,10000));
+            console.log('[WAIT] More waiting...');
+            await new Promise(r => setTimeout(r, 8000));
         }
 
         if (videoUrl) {
@@ -178,6 +166,16 @@ async function extractVideoUrl(watchUrl) {
             return result;
         }
 
+        // Debug: log unique non-static URLs
+        console.log('[DEBUG] All non-static URLs seen:');
+        const filtered = allUrls.filter(u =>
+            !u.includes('.css') && !u.includes('.js') && !u.includes('.png') &&
+            !u.includes('.jpg') && !u.includes('.svg') && !u.includes('.woff') &&
+            !u.includes('.gif') && !u.includes('.ico') && !u.includes('cloudflare') &&
+            !u.includes('google') && !u.includes('sharethis') && !u.includes('gravatar')
+        );
+        filtered.slice(-30).forEach(u => console.log('  ' + u));
+
         console.log('[FAIL] No video URL found');
         return null;
 
@@ -186,21 +184,14 @@ async function extractVideoUrl(watchUrl) {
     }
 }
 
-// API endpoint
 app.get('/extract', async (req, res) => {
     const url = req.query.url;
-    if (!url) {
-        return res.status(400).json({ error: 'Missing url parameter' });
-    }
+    if (!url) return res.status(400).json({ error: 'Missing url parameter' });
 
     try {
         const result = await extractVideoUrl(url);
         if (result) {
-            res.json({
-                status: 'ok',
-                videoUrl: result.videoUrl,
-                subtitles: result.subtitles,
-            });
+            res.json({ status: 'ok', videoUrl: result.videoUrl, subtitles: result.subtitles });
         } else {
             res.status(404).json({ status: 'error', error: 'No video URL found' });
         }
@@ -210,7 +201,6 @@ app.get('/extract', async (req, res) => {
     }
 });
 
-// Health check
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
 });
@@ -219,7 +209,6 @@ app.listen(PORT, '0.0.0.0', () => {
     console.log(`Sozo Video Extractor running on port ${PORT}`);
 });
 
-// Graceful shutdown
 process.on('SIGTERM', async () => {
     if (browser) await browser.close();
     process.exit(0);

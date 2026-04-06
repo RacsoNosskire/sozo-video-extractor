@@ -1,5 +1,7 @@
 const express = require('express');
-const puppeteer = require('puppeteer');
+const puppeteer = require('puppeteer-extra');
+const StealthPlugin = require('puppeteer-extra-plugin-stealth');
+puppeteer.use(StealthPlugin());
 
 const app = express();
 const PORT = process.env.PORT || 3232;
@@ -105,10 +107,68 @@ async function extractVideoUrl(watchUrl) {
                 const server = document.querySelector('#servers a.active') || document.querySelector('#servers a');
                 if (server) server.click();
             });
+            console.log('[CLICK] Clicked first server');
         } catch (e) {}
 
-        // Wait longer for the video to load
-        await new Promise(r => setTimeout(r, 8000));
+        // Wait for megaup iframe and navigate to it directly to force load
+        await new Promise(r => setTimeout(r, 5000));
+
+        // Find megaup iframe URL and visit it directly
+        try {
+            const megaupUrl = await page.evaluate(() => {
+                const iframe = document.querySelector('iframe[src*="megaup"]');
+                return iframe ? iframe.src : '';
+            });
+            if (megaupUrl) {
+                console.log(`[MEGAUP] Found iframe: ${megaupUrl}`);
+                // Visit the megaup page directly in a new tab to bypass iframe restrictions
+                const megaupPage = await br.newPage();
+                await megaupPage.setUserAgent(
+                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
+                );
+                await megaupPage.setExtraHTTPHeaders({
+                    'Referer': watchUrl.replace(/#.*$/, ''),
+                });
+
+                // Capture network on this page too
+                const megaClient = await megaupPage.target().createCDPSession();
+                await megaClient.send('Network.enable');
+                megaClient.on('Network.requestWillBeSent', (params) => {
+                    const url = params.request.url;
+                    if (!videoUrl) {
+                        if (url.includes('.m3u8')) { console.log(`[MEGA HLS] ${url}`); videoUrl = url; }
+                        else if (url.match(/\.mp4(\?|$)/) && !url.includes('thumb')) { console.log(`[MEGA MP4] ${url}`); videoUrl = url; }
+                    }
+                    allUrls.push(url);
+                });
+
+                await megaupPage.goto(megaupUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                await new Promise(r => setTimeout(r, 8000));
+
+                // Try to extract from JWPlayer
+                if (!videoUrl) {
+                    const src = await megaupPage.evaluate(() => {
+                        if (typeof jwplayer !== 'undefined') {
+                            try {
+                                const p = jwplayer();
+                                if (p && p.getPlaylistItem) {
+                                    const item = p.getPlaylistItem();
+                                    if (item && item.file) return item.file;
+                                    if (item && item.sources && item.sources[0]) return item.sources[0].file;
+                                }
+                            } catch (e) {}
+                        }
+                        const v = document.querySelector('video');
+                        if (v) return v.src || v.currentSrc || '';
+                        return '';
+                    }).catch(() => '');
+                    if (src) { console.log(`[MEGA JW] ${src}`); videoUrl = src; }
+                }
+                await megaupPage.close().catch(() => {});
+            }
+        } catch (e) {
+            console.log(`[MEGAUP ERR] ${e.message}`);
+        }
 
         // If still no video URL, try to extract from JWPlayer or video element in any frame
         if (!videoUrl) {

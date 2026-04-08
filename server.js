@@ -345,6 +345,15 @@ app.get('/animepahe/video', async (req, res) => {
     const session = req.query.session;
     const epSession = req.query.ep;
     if (!session || !epSession) return res.status(400).json({ error: 'Missing session/ep' });
+    // Hard timeout so we never leave the client hanging if puppeteer wedges.
+    const overallTimeout = setTimeout(() => {
+        if (!res.headersSent) {
+            console.log('[PAHE] overall timeout — replying 504');
+            res.status(504).json({ status: 'error', error: 'Extractor timeout' });
+        }
+    }, 75000);
+    res.on('finish', () => clearTimeout(overallTimeout));
+    res.on('close', () => clearTimeout(overallTimeout));
     try {
         const br = await getBrowser();
         const page = await br.newPage();
@@ -414,9 +423,9 @@ app.get('/animepahe/video', async (req, res) => {
                     if (!foundUrl && u.includes('.m3u8')) foundUrl = u;
                     if (!foundUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) foundUrl = u;
                 });
-                await kp.goto(kwikLink, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                await kp.goto(kwikLink, { waitUntil: 'domcontentloaded', timeout: 25000 }).catch(() => {});
                 const start = Date.now();
-                while (!foundUrl && Date.now() - start < 8000) {
+                while (!foundUrl && Date.now() - start < 15000) {
                     await new Promise(r => setTimeout(r, 200));
                 }
                 if (!foundUrl) {

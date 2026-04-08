@@ -123,20 +123,22 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
         // the segment host (owocdn.top), which Chromium solves and stores cf_clearance.
         // Wait long enough for the video element to actually start loading segments,
         // then harvest cookies for the segment host from this same page.
+        // Diagnostic: try to actually fetch the m3u8 from inside the kwik page context
+        // (which has the correct origin/cookies). If this works, owocdn is gating on
+        // session — and we can proxy via this server. If it 403s here too, the URL
+        // signature itself is bound to something we can't replicate.
         let segmentCookies = '';
         try {
-            // Make sure kwik's player actually starts. Try clicking play in case autoplay
-            // is blocked, and wait for any owocdn segment fetches to complete.
-            await page.evaluate(() => {
-                const v = document.querySelector('video');
-                if (v) { v.muted = true; v.play().catch(() => {}); }
-            }).catch(() => {});
-            // Poll until cf_clearance for the segment host shows up, up to 12s.
-            for (let i = 0; i < 24; i++) {
-                const cs = await page.cookies(videoUrl);
-                if (cs.some(c => c.name === 'cf_clearance')) break;
-                await new Promise(r => setTimeout(r, 500));
-            }
+            const probe = await page.evaluate(async (u) => {
+                try {
+                    const r = await fetch(u, { credentials: 'include' });
+                    return { ok: r.ok, status: r.status, len: r.ok ? (await r.text()).length : 0 };
+                } catch (e) {
+                    return { ok: false, status: -1, err: String(e) };
+                }
+            }, videoUrl);
+            console.log(`[KWIK] in-page fetch ${videoUrl}: ${JSON.stringify(probe)}`);
+
             const cookies = await page.cookies(videoUrl);
             segmentCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
             console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}: ${cookies.map(c => c.name).join(',')}`);

@@ -345,31 +345,51 @@ app.get('/animepahe/episodes', async (req, res) => {
 // For shows where the play page returns 500 (e.g. Naruto), the links API
 // still returns the kwik embed URLs as { "720": { "kwik": "..." }, ... }
 async function fetchApiLinks(session, epSession) {
-    try {
-        const body = await paheApiCall(`/api?m=links&id=${epSession}&session=${session}&p=kwik`);
-        const json = JSON.parse(body);
-        if (!json.data) return [];
-        const out = [];
-        for (const entry of json.data) {
-            for (const [resolution, info] of Object.entries(entry)) {
-                if (info && info.kwik) {
-                    out.push({
-                        kwikUrl: info.kwik,
-                        fansub: info.fansub || 'AnimePahe',
-                        resolution,
-                        audio: info.audio || 'jpn',
-                        quality: info.hd ? 'HD' : '',
-                        isActive: false,
-                        fullText: `${info.fansub || ''} · ${resolution}p`.trim(),
-                    });
+    // Try every known animepahe embed endpoint variant until one parses.
+    const variants = [
+        `/api?m=embed&id=${epSession}&p=kwik`,
+        `/api?m=embed&id=${epSession}&session=${session}&p=kwik`,
+        `/api?m=links&id=${epSession}&p=kwik`,
+    ];
+    for (const path of variants) {
+        try {
+            const body = await paheApiCall(path);
+            let json;
+            try {
+                json = JSON.parse(body);
+            } catch {
+                console.log(`[API LINKS] ${path} -> non-json: ${body.slice(0, 120)}`);
+                continue;
+            }
+            if (!json || !json.data || !Array.isArray(json.data) || json.data.length === 0) {
+                console.log(`[API LINKS] ${path} -> empty: ${JSON.stringify(json).slice(0, 120)}`);
+                continue;
+            }
+            const out = [];
+            for (const entry of json.data) {
+                for (const [resolution, info] of Object.entries(entry)) {
+                    if (info && info.kwik) {
+                        out.push({
+                            kwikUrl: info.kwik,
+                            fansub: info.fansub || 'AnimePahe',
+                            resolution,
+                            audio: info.audio || 'jpn',
+                            quality: info.hd ? 'HD' : '',
+                            isActive: false,
+                            fullText: `${info.fansub || ''} · ${resolution}p`.trim(),
+                        });
+                    }
                 }
             }
+            if (out.length > 0) {
+                console.log(`[API LINKS] ${path} -> ${out.length} entries`);
+                return out;
+            }
+        } catch (e) {
+            console.log(`[API LINKS] ${path} threw: ${e.message}`);
         }
-        return out;
-    } catch (e) {
-        console.log(`[API LINKS] failed: ${e.message}`);
-        return [];
     }
+    return [];
 }
 
 // Extract video URL from animepahe play page (Kwik embed)

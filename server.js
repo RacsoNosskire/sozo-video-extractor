@@ -431,10 +431,17 @@ app.get('/animepahe/video', async (req, res) => {
 
         if (optionMeta.length > 0) {
             console.log(`[PAHE] Found ${optionMeta.length} quality buttons`);
-            // Resolve each kwik embed in parallel.
-            const resolved = (await Promise.all(
-                optionMeta.map((m) => resolveKwikStream(m.kwikUrl, m).catch(() => null))
-            )).filter(Boolean);
+            // Resolve each kwik embed sequentially — running 6 puppeteer tabs in
+            // parallel was causing some kwik pages to time out and the whole batch
+            // to come back empty for shows like Naruto.
+            const resolved = [];
+            for (const m of optionMeta) {
+                const r = await resolveKwikStream(m.kwikUrl, m).catch((e) => {
+                    console.log(`[KWIK ERR] ${m.kwikUrl}: ${e.message}`);
+                    return null;
+                });
+                if (r) resolved.push(r);
+            }
             // Sort highest resolution first.
             resolved.sort((a, b) => {
                 const ra = parseInt(String(a.resolution).match(/\d+/)?.[0] || '0', 10);

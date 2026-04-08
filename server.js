@@ -326,10 +326,11 @@ app.get('/animepahe/search', async (req, res) => {
 // Get episodes (uses cached cookies)
 app.get('/animepahe/episodes', async (req, res) => {
     const session = req.query.session;
+    const page = parseInt(req.query.page, 10) || 1;
     if (!session) return res.status(400).json({ error: 'Missing session parameter' });
     try {
-        console.log(`[PAHE] Episodes: ${session}`);
-        const body = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=1`);
+        console.log(`[PAHE] Episodes: ${session} page=${page}`);
+        const body = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=${page}`);
         try {
             res.json({ status: 'ok', data: JSON.parse(body) });
         } catch (e) {

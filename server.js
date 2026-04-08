@@ -461,16 +461,26 @@ app.get('/animepahe/video', async (req, res) => {
 
         const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
         console.log(`[PAHE] Play: ${playUrl}`);
-        // Warm the session: hit homepage (solves DDoS-Guard), then the anime
-        // detail page (establishes the referer chain some shows require). Some
-        // older shows like Naruto return 500 on /play/ when you navigate
-        // directly from / without going through /anime/<session> first.
-        await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await new Promise(r => setTimeout(r, 1500));
-        const animeUrl = `https://animepahe.pw/anime/${session}`;
-        await page.goto(animeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        await new Promise(r => setTimeout(r, 1500));
-        await page.setExtraHTTPHeaders({ Referer: animeUrl });
+        // CRITICAL: the ep_session the client passed was issued by animepahe
+        // *for the cookie set that paheApiCall used* when it hit /api?m=release.
+        // If puppeteer creates a new DDoS-Guard session here, animepahe binds
+        // the /play/ URL to the new cookies and the old ep_session becomes
+        // invalid → 500 SERVER ERROR. So seed the puppeteer page with the
+        // exact same cookies paheApiCall is using.
+        const sharedCookieStr = await refreshPaheCookies();
+        if (sharedCookieStr) {
+            const cookieObjs = sharedCookieStr.split('; ').map((kv) => {
+                const i = kv.indexOf('=');
+                return {
+                    name: kv.slice(0, i),
+                    value: kv.slice(i + 1),
+                    domain: '.animepahe.pw',
+                    path: '/',
+                };
+            }).filter(c => c.name);
+            await page.setCookie(...cookieObjs).catch(() => {});
+        }
+        await page.setExtraHTTPHeaders({ Referer: `https://animepahe.pw/anime/${session}` });
         await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         // Wait for the resolution menu to actually render — up to 8 s.
         try {

@@ -396,7 +396,7 @@ app.get('/animepahe/video', async (req, res) => {
 
         // Debug: dump cookies + response headers + page content for the play page.
         const dbgCookies = await page.cookies().catch(() => []);
-        console.log(`[PAHE DBG] cookies(${dbgCookies.length})=${dbgCookies.map(c => c.name).join(',')}`);
+        console.log(`[PAHE DBG] cookies(${dbgCookies.length})=${dbgCookies.map(c => `${c.name}=${(c.value || '').slice(0, 30)}`).join(' | ')}`);
         const dbgBody = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
         console.log(`[PAHE DBG] body="${dbgBody.replace(/\n/g, ' ')}"`);
 

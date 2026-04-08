@@ -118,31 +118,30 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
 
         if (!videoUrl) return null;
 
-        // Have Chromium actually navigate to the m3u8 so it processes any Cloudflare
-        // interstitial on the segment host (owocdn.top, etc) and stores the clearance
-        // cookie. fetch(no-cors) won't do — opaque responses don't expose Set-Cookie.
-        // We open a fresh tab, point it at the m3u8 URL, and harvest cookies after.
+        // Kwik's own page auto-plays the m3u8 in a <video> element. That media fetch
+        // goes through Chromium's network stack and triggers Cloudflare's challenge for
+        // the segment host (owocdn.top), which Chromium solves and stores cf_clearance.
+        // Wait long enough for the video element to actually start loading segments,
+        // then harvest cookies for the segment host from this same page.
         let segmentCookies = '';
-        const cookiePage = await br.newPage();
         try {
-            await cookiePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-            await cookiePage.setExtraHTTPHeaders({ Referer: 'https://kwik.si/' });
-            // Navigate to the m3u8 directly. Even if it returns the playlist body or a
-            // CF challenge HTML, Chromium will store any Set-Cookie headers.
-            await cookiePage.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-            // If a CF interstitial is shown, give its JS time to set cf_clearance.
-            for (let i = 0; i < 20; i++) {
-                const cs = await cookiePage.cookies(videoUrl);
+            // Make sure kwik's player actually starts. Try clicking play in case autoplay
+            // is blocked, and wait for any owocdn segment fetches to complete.
+            await page.evaluate(() => {
+                const v = document.querySelector('video');
+                if (v) { v.muted = true; v.play().catch(() => {}); }
+            }).catch(() => {});
+            // Poll until cf_clearance for the segment host shows up, up to 12s.
+            for (let i = 0; i < 24; i++) {
+                const cs = await page.cookies(videoUrl);
                 if (cs.some(c => c.name === 'cf_clearance')) break;
                 await new Promise(r => setTimeout(r, 500));
             }
-            const cookies = await cookiePage.cookies(videoUrl);
+            const cookies = await page.cookies(videoUrl);
             segmentCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
             console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}: ${cookies.map(c => c.name).join(',')}`);
         } catch (e) {
             console.log(`[KWIK] Cookie harvest failed: ${e.message}`);
-        } finally {
-            await cookiePage.close().catch(() => {});
         }
 
         return {

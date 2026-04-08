@@ -118,22 +118,31 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
 
         if (!videoUrl) return null;
 
-        // Have puppeteer actually fetch the m3u8 so the browser solves the per-domain
-        // Cloudflare challenge on the segment host (owocdn.top, etc) and stores its
-        // clearance cookie. Then harvest the cookies for that host so the Android client
-        // can replay them via ExoPlayer's HTTP layer.
+        // Have Chromium actually navigate to the m3u8 so it processes any Cloudflare
+        // interstitial on the segment host (owocdn.top, etc) and stores the clearance
+        // cookie. fetch(no-cors) won't do — opaque responses don't expose Set-Cookie.
+        // We open a fresh tab, point it at the m3u8 URL, and harvest cookies after.
         let segmentCookies = '';
+        const cookiePage = await br.newPage();
         try {
-            await page.evaluate(async (u) => {
-                try { await fetch(u, { credentials: 'include', mode: 'no-cors' }); } catch (e) {}
-            }, videoUrl);
-            // Give Cloudflare a moment to set the clearance cookie after the challenge.
-            await new Promise(r => setTimeout(r, 1500));
-            const cookies = await page.cookies(videoUrl);
+            await cookiePage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+            await cookiePage.setExtraHTTPHeaders({ Referer: 'https://kwik.si/' });
+            // Navigate to the m3u8 directly. Even if it returns the playlist body or a
+            // CF challenge HTML, Chromium will store any Set-Cookie headers.
+            await cookiePage.goto(videoUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+            // If a CF interstitial is shown, give its JS time to set cf_clearance.
+            for (let i = 0; i < 20; i++) {
+                const cs = await cookiePage.cookies(videoUrl);
+                if (cs.some(c => c.name === 'cf_clearance')) break;
+                await new Promise(r => setTimeout(r, 500));
+            }
+            const cookies = await cookiePage.cookies(videoUrl);
             segmentCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-            console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}`);
+            console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}: ${cookies.map(c => c.name).join(',')}`);
         } catch (e) {
             console.log(`[KWIK] Cookie harvest failed: ${e.message}`);
+        } finally {
+            await cookiePage.close().catch(() => {});
         }
 
         return {

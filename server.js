@@ -372,7 +372,87 @@ app.get('/animepahe/video', async (req, res) => {
         await page.goto(playUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
         await new Promise(r => setTimeout(r, 1500));
 
-        // Extract Kwik link from page
+        // Read every quality button so we can return them all to the app.
+        const optionMeta = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll('#resolutionMenu button[data-src], button.dropdown-item[data-src]')).map((button) => {
+                const badges = Array.from(button.querySelectorAll('span.badge')).map((el) => el.textContent?.trim()).filter(Boolean);
+                return {
+                    kwikUrl: button.getAttribute('data-src') || '',
+                    fansub: button.getAttribute('data-fansub') || 'AnimePahe',
+                    resolution: button.getAttribute('data-resolution') || '',
+                    audio: button.getAttribute('data-audio') || 'jpn',
+                    quality: badges.find((t) => /BD|WEB|DVD/i.test(t || '')) || '',
+                    isActive: button.classList.contains('active'),
+                    fullText: (button.textContent || '').trim(),
+                };
+            }).filter((item) => item.kwikUrl);
+        }).catch(() => []);
+
+        // Helper: open one kwik embed in a fresh tab and capture the m3u8 URL it loads.
+        async function resolveKwikStream(kwikLink, meta) {
+            const kp = await br.newPage();
+            try {
+                await kp.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+                await kp.setExtraHTTPHeaders({ 'Referer': 'https://animepahe.pw/' });
+                let foundUrl = '';
+                const cdp = await kp.target().createCDPSession();
+                await cdp.send('Network.enable');
+                cdp.on('Network.requestWillBeSent', (params) => {
+                    const u = params.request.url;
+                    if (!foundUrl && u.includes('.m3u8')) foundUrl = u;
+                    if (!foundUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) foundUrl = u;
+                });
+                await kp.goto(kwikLink, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+                const start = Date.now();
+                while (!foundUrl && Date.now() - start < 8000) {
+                    await new Promise(r => setTimeout(r, 200));
+                }
+                if (!foundUrl) {
+                    foundUrl = await kp.evaluate(() => {
+                        const v = document.querySelector('video');
+                        return v ? (v.src || v.currentSrc || '') : '';
+                    }).catch(() => '');
+                }
+                if (!foundUrl) return null;
+                return {
+                    videoUrl: foundUrl,
+                    kwikUrl: kwikLink,
+                    fansub: meta.fansub,
+                    resolution: meta.resolution,
+                    audio: meta.audio,
+                    quality: meta.quality,
+                    isActive: meta.isActive,
+                    fullText: meta.fullText,
+                };
+            } finally {
+                await kp.close().catch(() => {});
+            }
+        }
+
+        if (optionMeta.length > 0) {
+            console.log(`[PAHE] Found ${optionMeta.length} quality buttons`);
+            // Resolve each kwik embed in parallel.
+            const resolved = (await Promise.all(
+                optionMeta.map((m) => resolveKwikStream(m.kwikUrl, m).catch(() => null))
+            )).filter(Boolean);
+            // Sort highest resolution first.
+            resolved.sort((a, b) => {
+                const ra = parseInt(String(a.resolution).match(/\d+/)?.[0] || '0', 10);
+                const rb = parseInt(String(b.resolution).match(/\d+/)?.[0] || '0', 10);
+                return rb - ra;
+            });
+            await page.close().catch(() => {});
+            if (resolved.length > 0) {
+                return res.json({
+                    status: 'ok',
+                    options: resolved,
+                    videoUrl: resolved[0].videoUrl,
+                    kwikUrl: resolved[0].kwikUrl,
+                });
+            }
+        }
+
+        // Fallback: legacy single-quality flow.
         const kwikUrl = await page.evaluate(() => {
             const btn = document.querySelector('#resolutionMenu button[data-src], button.dropdown-item[data-src]');
             return btn ? btn.getAttribute('data-src') : '';

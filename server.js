@@ -341,6 +341,37 @@ app.get('/animepahe/episodes', async (req, res) => {
     }
 });
 
+// Try animepahe's JSON API first — bypasses the /play/ HTML page entirely.
+// For shows where the play page returns 500 (e.g. Naruto), the links API
+// still returns the kwik embed URLs as { "720": { "kwik": "..." }, ... }
+async function fetchApiLinks(session, epSession) {
+    try {
+        const body = await paheApiCall(`/api?m=links&id=${epSession}&session=${session}&p=kwik`);
+        const json = JSON.parse(body);
+        if (!json.data) return [];
+        const out = [];
+        for (const entry of json.data) {
+            for (const [resolution, info] of Object.entries(entry)) {
+                if (info && info.kwik) {
+                    out.push({
+                        kwikUrl: info.kwik,
+                        fansub: info.fansub || 'AnimePahe',
+                        resolution,
+                        audio: info.audio || 'jpn',
+                        quality: info.hd ? 'HD' : '',
+                        isActive: false,
+                        fullText: `${info.fansub || ''} · ${resolution}p`.trim(),
+                    });
+                }
+            }
+        }
+        return out;
+    } catch (e) {
+        console.log(`[API LINKS] failed: ${e.message}`);
+        return [];
+    }
+}
+
 // Extract video URL from animepahe play page (Kwik embed)
 app.get('/animepahe/video', async (req, res) => {
     const session = req.query.session;
@@ -356,6 +387,37 @@ app.get('/animepahe/video', async (req, res) => {
     res.on('finish', () => clearTimeout(overallTimeout));
     res.on('close', () => clearTimeout(overallTimeout));
     try {
+        // Fast path: JSON API. Works even when /play/ returns 500 (Naruto etc).
+        const apiMeta = await fetchApiLinks(session, epSession);
+        if (apiMeta.length > 0) {
+            console.log(`[PAHE] API returned ${apiMeta.length} quality entries`);
+            const br = await getBrowser();
+            const resolved = [];
+            for (const m of apiMeta) {
+                const r = await resolveKwikStream(br, m.kwikUrl, 'https://animepahe.pw/', m).catch((e) => {
+                    console.log(`[KWIK ERR] ${m.kwikUrl}: ${e.message}`);
+                    return null;
+                });
+                if (r) resolved.push(r);
+            }
+            resolved.sort((a, b) => {
+                const ra = parseInt(String(a.resolution).match(/\d+/)?.[0] || '0', 10);
+                const rb = parseInt(String(b.resolution).match(/\d+/)?.[0] || '0', 10);
+                return rb - ra;
+            });
+            if (resolved.length > 0) {
+                clearTimeout(overallTimeout);
+                if (!res.headersSent) {
+                    return res.json({
+                        status: 'ok',
+                        options: resolved,
+                        videoUrl: resolved[0].videoUrl,
+                        kwikUrl: resolved[0].kwikUrl,
+                    });
+                }
+                return;
+            }
+        }
         const br = await getBrowser();
         const page = await br.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');

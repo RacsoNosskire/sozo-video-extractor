@@ -118,9 +118,28 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
 
         if (!videoUrl) return null;
 
+        // Have puppeteer actually fetch the m3u8 so the browser solves the per-domain
+        // Cloudflare challenge on the segment host (owocdn.top, etc) and stores its
+        // clearance cookie. Then harvest the cookies for that host so the Android client
+        // can replay them via ExoPlayer's HTTP layer.
+        let segmentCookies = '';
+        try {
+            await page.evaluate(async (u) => {
+                try { await fetch(u, { credentials: 'include', mode: 'no-cors' }); } catch (e) {}
+            }, videoUrl);
+            // Give Cloudflare a moment to set the clearance cookie after the challenge.
+            await new Promise(r => setTimeout(r, 1500));
+            const cookies = await page.cookies(videoUrl);
+            segmentCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
+            console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}`);
+        } catch (e) {
+            console.log(`[KWIK] Cookie harvest failed: ${e.message}`);
+        }
+
         return {
             videoUrl,
             kwikUrl,
+            cookies: segmentCookies,
             resolution: meta.resolution || 'Auto',
             fansub: meta.fansub || 'AnimePahe',
             audio: meta.audio || 'jpn',

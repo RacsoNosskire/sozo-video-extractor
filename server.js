@@ -369,8 +369,20 @@ app.get('/animepahe/video', async (req, res) => {
 
         const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
         console.log(`[PAHE] Play: ${playUrl}`);
-        await page.goto(playUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
-        await new Promise(r => setTimeout(r, 1500));
+        // Forward the cached DDoS-Guard cookies so the play page renders fully
+        // (without these animepahe sometimes returns a stub that has no
+        // resolutionMenu — just the font request).
+        const paheCookies = await refreshPaheCookies();
+        if (paheCookies) {
+            await page.setExtraHTTPHeaders({ Cookie: paheCookies });
+        }
+        await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+        // Wait for the resolution menu to actually render — up to 8 s.
+        try {
+            await page.waitForSelector('#resolutionMenu button[data-src], button.dropdown-item[data-src]', { timeout: 8000 });
+        } catch {
+            console.log('[PAHE] resolutionMenu never appeared');
+        }
 
         // Read every quality button so we can return them all to the app.
         const optionMeta = await page.evaluate(() => {

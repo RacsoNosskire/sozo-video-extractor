@@ -92,12 +92,18 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
         await page.setExtraHTTPHeaders({ Referer: referer });
 
-        const client = await page.target().createCDPSession();
-        await client.send('Network.enable');
-        client.on('Network.requestWillBeSent', (params) => {
-            const u = params.request.url;
-            if (!videoUrl && u.includes('.m3u8')) videoUrl = u;
-            if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) videoUrl = u;
+        // Intercept and ABORT the m3u8 request the moment kwik's player tries to fetch it.
+        // The signed CDN URL appears to be one-time-use — if Chromium's HLS player consumes
+        // it here, the device gets a 403 when it later tries to fetch the same URL.
+        await page.setRequestInterception(true);
+        page.on('request', (req) => {
+            const u = req.url();
+            if (u.includes('.m3u8') || (u.match(/\.mp4(\?|$)/) && !u.includes('thumb'))) {
+                if (!videoUrl) videoUrl = u;
+                req.abort().catch(() => {});
+                return;
+            }
+            req.continue().catch(() => {});
         });
 
         await page.goto(kwikUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
@@ -123,28 +129,9 @@ async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
         // the segment host (owocdn.top), which Chromium solves and stores cf_clearance.
         // Wait long enough for the video element to actually start loading segments,
         // then harvest cookies for the segment host from this same page.
-        // Diagnostic: try to actually fetch the m3u8 from inside the kwik page context
-        // (which has the correct origin/cookies). If this works, owocdn is gating on
-        // session — and we can proxy via this server. If it 403s here too, the URL
-        // signature itself is bound to something we can't replicate.
-        let segmentCookies = '';
-        try {
-            const probe = await page.evaluate(async (u) => {
-                try {
-                    const r = await fetch(u, { credentials: 'include' });
-                    return { ok: r.ok, status: r.status, len: r.ok ? (await r.text()).length : 0 };
-                } catch (e) {
-                    return { ok: false, status: -1, err: String(e) };
-                }
-            }, videoUrl);
-            console.log(`[KWIK] in-page fetch ${videoUrl}: ${JSON.stringify(probe)}`);
-
-            const cookies = await page.cookies(videoUrl);
-            segmentCookies = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-            console.log(`[KWIK] Got ${cookies.length} cookies for ${new URL(videoUrl).host}: ${cookies.map(c => c.name).join(',')}`);
-        } catch (e) {
-            console.log(`[KWIK] Cookie harvest failed: ${e.message}`);
-        }
+        // The m3u8 URL is one-time-use — we aborted Chromium's own fetch above so the
+        // URL stays virgin for the device.
+        const segmentCookies = '';
 
         return {
             videoUrl,

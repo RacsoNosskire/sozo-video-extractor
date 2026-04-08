@@ -394,6 +394,27 @@ app.get('/animepahe/video', async (req, res) => {
             console.log('[PAHE] resolutionMenu never appeared');
         }
 
+        // Debug: dump what selectors actually exist on the page so we can tell
+        // whether the resolution buttons live under a different id for some shows.
+        const debugInfo = await page.evaluate(() => {
+            const info = {
+                title: document.title,
+                bodyLen: document.body?.innerHTML?.length || 0,
+                resolutionMenuCount: document.querySelectorAll('#resolutionMenu').length,
+                dataSrcCount: document.querySelectorAll('[data-src]').length,
+                pickResolutionCount: document.querySelectorAll('#pickResolution, #pickResolution button').length,
+                resolutionDataResAttrs: Array.from(document.querySelectorAll('[data-resolution]')).slice(0, 6).map(el => ({
+                    tag: el.tagName,
+                    id: el.id,
+                    parentId: el.parentElement?.id,
+                    res: el.getAttribute('data-resolution'),
+                    src: (el.getAttribute('data-src') || '').slice(0, 60),
+                })),
+            };
+            return info;
+        }).catch(() => ({}));
+        console.log(`[PAHE DBG] ${JSON.stringify(debugInfo)}`);
+
         // Read every quality button so we can return them all to the app.
         const optionMeta = await page.evaluate(() => {
             return Array.from(document.querySelectorAll('#resolutionMenu button[data-src], button.dropdown-item[data-src]')).map((button) => {

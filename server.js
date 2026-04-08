@@ -79,76 +79,6 @@ function setCache(key, value) {
     cache.set(key, { value, time: Date.now() });
 }
 
-function extractResolutionNumber(value) {
-    const match = String(value || '').match(/(\d{3,4})p/i);
-    return match ? Number(match[1]) : 0;
-}
-
-async function resolveKwikStream(br, kwikUrl, referer, meta = {}) {
-    const page = await br.newPage();
-    let videoUrl = '';
-
-    try {
-        await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
-        await page.setExtraHTTPHeaders({ Referer: referer });
-
-        // Intercept and ABORT the m3u8 request the moment kwik's player tries to fetch it.
-        // The signed CDN URL appears to be one-time-use — if Chromium's HLS player consumes
-        // it here, the device gets a 403 when it later tries to fetch the same URL.
-        await page.setRequestInterception(true);
-        page.on('request', (req) => {
-            const u = req.url();
-            if (u.includes('.m3u8') || (u.match(/\.mp4(\?|$)/) && !u.includes('thumb'))) {
-                if (!videoUrl) videoUrl = u;
-                req.abort().catch(() => {});
-                return;
-            }
-            req.continue().catch(() => {});
-        });
-
-        await page.goto(kwikUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-
-        const start = Date.now();
-        while (!videoUrl && Date.now() - start < 8000) {
-            await new Promise(r => setTimeout(r, 200));
-        }
-
-        if (!videoUrl) {
-            const src = await page.evaluate(() => {
-                const v = document.querySelector('video');
-                if (v) return v.src || v.currentSrc || '';
-                return '';
-            }).catch(() => '');
-            if (src) videoUrl = src;
-        }
-
-        if (!videoUrl) return null;
-
-        // Kwik's own page auto-plays the m3u8 in a <video> element. That media fetch
-        // goes through Chromium's network stack and triggers Cloudflare's challenge for
-        // the segment host (owocdn.top), which Chromium solves and stores cf_clearance.
-        // Wait long enough for the video element to actually start loading segments,
-        // then harvest cookies for the segment host from this same page.
-        // The m3u8 URL is one-time-use — we aborted Chromium's own fetch above so the
-        // URL stays virgin for the device.
-        const segmentCookies = '';
-
-        return {
-            videoUrl,
-            kwikUrl,
-            cookies: segmentCookies,
-            resolution: meta.resolution || 'Auto',
-            fansub: meta.fansub || 'AnimePahe',
-            audio: meta.audio || 'jpn',
-            quality: meta.quality || '',
-            fullText: meta.fullText || meta.resolution || 'AnimePahe Stream',
-            isActive: Boolean(meta.isActive),
-        };
-    } finally {
-        await page.close().catch(() => {});
-    }
-}
-
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of cache) {
@@ -442,44 +372,6 @@ app.get('/animepahe/video', async (req, res) => {
         await page.goto(playUrl, { waitUntil: 'domcontentloaded', timeout: 20000 });
         await new Promise(r => setTimeout(r, 1500));
 
-        const optionMeta = await page.evaluate(() => {
-            return Array.from(document.querySelectorAll('#resolutionMenu button[data-src], button.dropdown-item[data-src]')).map((button) => {
-                const badges = Array.from(button.querySelectorAll('span.badge')).map((el) => el.textContent?.trim()).filter(Boolean);
-                return {
-                    kwikUrl: button.getAttribute('data-src') || '',
-                    fansub: button.getAttribute('data-fansub') || 'AnimePahe',
-                    resolution: button.getAttribute('data-resolution') || '',
-                    audio: button.getAttribute('data-audio') || 'jpn',
-                    quality: badges.find((text) => /BD|WEB|DVD/i.test(text || '')) || '',
-                    isActive: button.classList.contains('active'),
-                    fullText: (button.textContent || '').trim(),
-                };
-            }).filter((item) => item.kwikUrl);
-        }).catch(() => []);
-
-        if (optionMeta.length > 0) {
-            console.log(`[PAHE] Found ${optionMeta.length} quality buttons`);
-            const seen = new Set();
-            const options = [];
-            for (const meta of optionMeta.sort((a, b) => extractResolutionNumber(b.resolution) - extractResolutionNumber(a.resolution))) {
-                if (seen.has(meta.kwikUrl)) continue;
-                seen.add(meta.kwikUrl);
-                const resolved = await resolveKwikStream(br, meta.kwikUrl, 'https://animepahe.pw/', meta).catch(() => null);
-                if (resolved) options.push(resolved);
-            }
-
-            await page.close().catch(() => {});
-
-            if (options.length > 0) {
-                return res.json({
-                    status: 'ok',
-                    options,
-                    videoUrl: options[0].videoUrl,
-                    kwikUrl: options[0].kwikUrl,
-                });
-            }
-        }
-
         // Extract Kwik link from page
         const kwikUrl = await page.evaluate(() => {
             const btn = document.querySelector('#resolutionMenu button[data-src], button.dropdown-item[data-src]');
@@ -488,15 +380,34 @@ app.get('/animepahe/video', async (req, res) => {
 
         if (kwikUrl) {
             console.log(`[KWIK] ${kwikUrl}`);
-            const resolved = await resolveKwikStream(br, kwikUrl, 'https://animepahe.pw/', {
-                fansub: 'AnimePahe',
-                resolution: 'Auto',
-                audio: 'jpn',
-                quality: 'Auto',
-                isActive: true,
-                fullText: 'AnimePahe Stream',
-            }).catch(() => null);
-            if (resolved?.videoUrl) videoUrl = resolved.videoUrl;
+            const kwikPage = await br.newPage();
+            await kwikPage.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
+            await kwikPage.setExtraHTTPHeaders({ 'Referer': 'https://animepahe.pw/' });
+
+            const kwikClient = await kwikPage.target().createCDPSession();
+            await kwikClient.send('Network.enable');
+            kwikClient.on('Network.requestWillBeSent', (params) => {
+                const u = params.request.url;
+                if (!videoUrl && u.includes('.m3u8')) { console.log(`[HLS] ${u}`); videoUrl = u; }
+                if (!videoUrl && u.match(/\.mp4(\?|$)/) && !u.includes('thumb')) { console.log(`[MP4] ${u}`); videoUrl = u; }
+            });
+            await kwikPage.goto(kwikUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
+
+            // Poll for the video URL instead of fixed wait
+            const start = Date.now();
+            while (!videoUrl && Date.now() - start < 8000) {
+                await new Promise(r => setTimeout(r, 200));
+            }
+
+            if (!videoUrl) {
+                const src = await kwikPage.evaluate(() => {
+                    const v = document.querySelector('video');
+                    if (v) return v.src || v.currentSrc || '';
+                    return '';
+                }).catch(() => '');
+                if (src) videoUrl = src;
+            }
+            await kwikPage.close().catch(() => {});
         }
 
         await page.close().catch(() => {});

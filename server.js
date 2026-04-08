@@ -407,8 +407,28 @@ app.get('/animepahe/video', async (req, res) => {
     res.on('finish', () => clearTimeout(overallTimeout));
     res.on('close', () => clearTimeout(overallTimeout));
     try {
+        // Sanity check: re-fetch episode list for this show and verify the
+        // ep_session the client sent is still in it. If not, the client is
+        // holding a stale session hash and animepahe will 500 on /play.
+        let effectiveEp = epSession;
+        try {
+            const freshBody = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=1`);
+            const freshJson = JSON.parse(freshBody);
+            const freshSessions = (freshJson.data || []).map(e => e.session);
+            if (freshSessions.length > 0 && !freshSessions.includes(epSession)) {
+                console.log(`[PAHE] client ep ${epSession.slice(0, 12)} NOT in fresh list; first=${freshSessions[0].slice(0, 12)}`);
+                // Fall back to the first episode's fresh session. At least we
+                // can confirm whether the /play pipeline works at all for this show.
+                effectiveEp = freshSessions[0];
+            } else {
+                console.log(`[PAHE] client ep ${epSession.slice(0, 12)} IS in fresh list`);
+            }
+        } catch (e) {
+            console.log(`[PAHE] fresh release fetch failed: ${e.message}`);
+        }
+
         // Fast path: JSON API. Works even when /play/ returns 500 (Naruto etc).
-        const apiMeta = await fetchApiLinks(session, epSession);
+        const apiMeta = await fetchApiLinks(session, effectiveEp);
         if (apiMeta.length > 0) {
             console.log(`[PAHE] API returned ${apiMeta.length} quality entries`);
             const br = await getBrowser();
@@ -459,7 +479,7 @@ app.get('/animepahe/video', async (req, res) => {
             }
         });
 
-        const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
+        const playUrl = `https://animepahe.pw/play/${session}/${effectiveEp}`;
         console.log(`[PAHE] Play: ${playUrl}`);
         // CRITICAL: the ep_session the client passed was issued by animepahe
         // *for the cookie set that paheApiCall used* when it hit /api?m=release.

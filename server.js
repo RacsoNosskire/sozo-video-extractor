@@ -341,57 +341,6 @@ app.get('/animepahe/episodes', async (req, res) => {
     }
 });
 
-// Try animepahe's JSON API first — bypasses the /play/ HTML page entirely.
-// For shows where the play page returns 500 (e.g. Naruto), the links API
-// still returns the kwik embed URLs as { "720": { "kwik": "..." }, ... }
-async function fetchApiLinks(session, epSession) {
-    // Try every known animepahe embed endpoint variant until one parses.
-    const variants = [
-        `/api?m=embed&id=${epSession}&p=kwik`,
-        `/api?m=embed&id=${epSession}&session=${session}&p=kwik`,
-        `/api?m=links&id=${epSession}&p=kwik`,
-    ];
-    for (const path of variants) {
-        try {
-            const body = await paheApiCall(path);
-            let json;
-            try {
-                json = JSON.parse(body);
-            } catch {
-                console.log(`[API LINKS] ${path} -> non-json: ${body.slice(0, 120)}`);
-                continue;
-            }
-            if (!json || !json.data || !Array.isArray(json.data) || json.data.length === 0) {
-                console.log(`[API LINKS] ${path} -> empty: ${JSON.stringify(json).slice(0, 120)}`);
-                continue;
-            }
-            const out = [];
-            for (const entry of json.data) {
-                for (const [resolution, info] of Object.entries(entry)) {
-                    if (info && info.kwik) {
-                        out.push({
-                            kwikUrl: info.kwik,
-                            fansub: info.fansub || 'AnimePahe',
-                            resolution,
-                            audio: info.audio || 'jpn',
-                            quality: info.hd ? 'HD' : '',
-                            isActive: false,
-                            fullText: `${info.fansub || ''} · ${resolution}p`.trim(),
-                        });
-                    }
-                }
-            }
-            if (out.length > 0) {
-                console.log(`[API LINKS] ${path} -> ${out.length} entries`);
-                return out;
-            }
-        } catch (e) {
-            console.log(`[API LINKS] ${path} threw: ${e.message}`);
-        }
-    }
-    return [];
-}
-
 // Extract video URL from animepahe play page (Kwik embed)
 app.get('/animepahe/video', async (req, res) => {
     const session = req.query.session;
@@ -407,57 +356,6 @@ app.get('/animepahe/video', async (req, res) => {
     res.on('finish', () => clearTimeout(overallTimeout));
     res.on('close', () => clearTimeout(overallTimeout));
     try {
-        // Sanity check: re-fetch episode list for this show and verify the
-        // ep_session the client sent is still in it. If not, the client is
-        // holding a stale session hash and animepahe will 500 on /play.
-        let effectiveEp = epSession;
-        try {
-            const freshBody = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=1`);
-            const freshJson = JSON.parse(freshBody);
-            const freshSessions = (freshJson.data || []).map(e => e.session);
-            if (freshSessions.length > 0 && !freshSessions.includes(epSession)) {
-                console.log(`[PAHE] client ep ${epSession.slice(0, 12)} NOT in fresh list; first=${freshSessions[0].slice(0, 12)}`);
-                // Fall back to the first episode's fresh session. At least we
-                // can confirm whether the /play pipeline works at all for this show.
-                effectiveEp = freshSessions[0];
-            } else {
-                console.log(`[PAHE] client ep ${epSession.slice(0, 12)} IS in fresh list`);
-            }
-        } catch (e) {
-            console.log(`[PAHE] fresh release fetch failed: ${e.message}`);
-        }
-
-        // Fast path: JSON API. Works even when /play/ returns 500 (Naruto etc).
-        const apiMeta = await fetchApiLinks(session, effectiveEp);
-        if (apiMeta.length > 0) {
-            console.log(`[PAHE] API returned ${apiMeta.length} quality entries`);
-            const br = await getBrowser();
-            const resolved = [];
-            for (const m of apiMeta) {
-                const r = await resolveKwikStream(br, m.kwikUrl, 'https://animepahe.pw/', m).catch((e) => {
-                    console.log(`[KWIK ERR] ${m.kwikUrl}: ${e.message}`);
-                    return null;
-                });
-                if (r) resolved.push(r);
-            }
-            resolved.sort((a, b) => {
-                const ra = parseInt(String(a.resolution).match(/\d+/)?.[0] || '0', 10);
-                const rb = parseInt(String(b.resolution).match(/\d+/)?.[0] || '0', 10);
-                return rb - ra;
-            });
-            if (resolved.length > 0) {
-                clearTimeout(overallTimeout);
-                if (!res.headersSent) {
-                    return res.json({
-                        status: 'ok',
-                        options: resolved,
-                        videoUrl: resolved[0].videoUrl,
-                        kwikUrl: resolved[0].kwikUrl,
-                    });
-                }
-                return;
-            }
-        }
         const br = await getBrowser();
         const page = await br.newPage();
         await page.setUserAgent('Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36');
@@ -479,7 +377,7 @@ app.get('/animepahe/video', async (req, res) => {
             }
         });
 
-        const playUrl = `https://animepahe.pw/play/${session}/${effectiveEp}`;
+        const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
         console.log(`[PAHE] Play: ${playUrl}`);
         // CRITICAL: the ep_session the client passed was issued by animepahe
         // *for the cookie set that paheApiCall used* when it hit /api?m=release.
@@ -508,31 +406,6 @@ app.get('/animepahe/video', async (req, res) => {
         } catch {
             console.log('[PAHE] resolutionMenu never appeared');
         }
-
-        // Debug: dump cookies + response headers + page content for the play page.
-        const dbgCookies = await page.cookies().catch(() => []);
-        console.log(`[PAHE DBG] cookies(${dbgCookies.length})=${dbgCookies.map(c => `${c.name}=${(c.value || '').slice(0, 30)}`).join(' | ')}`);
-        const dbgBody = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
-        console.log(`[PAHE DBG] body="${dbgBody.replace(/\n/g, ' ')}"`);
-
-        const debugInfo = await page.evaluate(() => {
-            const info = {
-                title: document.title,
-                bodyLen: document.body?.innerHTML?.length || 0,
-                resolutionMenuCount: document.querySelectorAll('#resolutionMenu').length,
-                dataSrcCount: document.querySelectorAll('[data-src]').length,
-                pickResolutionCount: document.querySelectorAll('#pickResolution, #pickResolution button').length,
-                resolutionDataResAttrs: Array.from(document.querySelectorAll('[data-resolution]')).slice(0, 6).map(el => ({
-                    tag: el.tagName,
-                    id: el.id,
-                    parentId: el.parentElement?.id,
-                    res: el.getAttribute('data-resolution'),
-                    src: (el.getAttribute('data-src') || '').slice(0, 60),
-                })),
-            };
-            return info;
-        }).catch(() => ({}));
-        console.log(`[PAHE DBG] ${JSON.stringify(debugInfo)}`);
 
         // Read every quality button so we can return them all to the app.
         const optionMeta = await page.evaluate(() => {

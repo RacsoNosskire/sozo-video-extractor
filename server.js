@@ -461,13 +461,16 @@ app.get('/animepahe/video', async (req, res) => {
 
         const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
         console.log(`[PAHE] Play: ${playUrl}`);
-        // DDoS-Guard sometimes serves the play page as a stub (only the font
-        // request fires) until Chromium itself has solved the JS challenge in
-        // this very session. Hit the homepage first so the challenge runs and
-        // sets cookies on this puppeteer page, THEN navigate to the play URL.
+        // Warm the session: hit homepage (solves DDoS-Guard), then the anime
+        // detail page (establishes the referer chain some shows require). Some
+        // older shows like Naruto return 500 on /play/ when you navigate
+        // directly from / without going through /anime/<session> first.
         await page.goto('https://animepahe.pw/', { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
-        // Give the JS challenge a moment to set its cookies.
-        await new Promise(r => setTimeout(r, 2000));
+        await new Promise(r => setTimeout(r, 1500));
+        const animeUrl = `https://animepahe.pw/anime/${session}`;
+        await page.goto(animeUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
+        await new Promise(r => setTimeout(r, 1500));
+        await page.setExtraHTTPHeaders({ Referer: animeUrl });
         await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         // Wait for the resolution menu to actually render — up to 8 s.
         try {

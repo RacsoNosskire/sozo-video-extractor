@@ -378,12 +378,22 @@ app.get('/animepahe/video', async (req, res) => {
 
         const playUrl = `https://animepahe.pw/play/${session}/${epSession}`;
         console.log(`[PAHE] Play: ${playUrl}`);
-        // Forward the cached DDoS-Guard cookies so the play page renders fully
-        // (without these animepahe sometimes returns a stub that has no
-        // resolutionMenu — just the font request).
-        const paheCookies = await refreshPaheCookies();
-        if (paheCookies) {
-            await page.setExtraHTTPHeaders({ Cookie: paheCookies });
+        // Forward the cached DDoS-Guard cookies via the cookie jar (not as a
+        // raw Cookie header — puppeteer's network stack overrides that). Without
+        // valid DDoS-Guard cookies the play page returns a stub that never
+        // renders the resolutionMenu, breaking shows like Naruto.
+        const paheCookieStr = await refreshPaheCookies();
+        if (paheCookieStr) {
+            const cookieObjs = paheCookieStr.split('; ').map((kv) => {
+                const i = kv.indexOf('=');
+                return {
+                    name: kv.slice(0, i),
+                    value: kv.slice(i + 1),
+                    domain: '.animepahe.pw',
+                    path: '/',
+                };
+            }).filter(c => c.name);
+            await page.setCookie(...cookieObjs).catch(() => {});
         }
         await page.goto(playUrl, { waitUntil: 'networkidle2', timeout: 30000 }).catch(() => {});
         // Wait for the resolution menu to actually render — up to 8 s.

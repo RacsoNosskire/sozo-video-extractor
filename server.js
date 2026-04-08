@@ -394,8 +394,12 @@ app.get('/animepahe/video', async (req, res) => {
             console.log('[PAHE] resolutionMenu never appeared');
         }
 
-        // Debug: dump what selectors actually exist on the page so we can tell
-        // whether the resolution buttons live under a different id for some shows.
+        // Debug: dump cookies + response headers + page content for the play page.
+        const dbgCookies = await page.cookies().catch(() => []);
+        console.log(`[PAHE DBG] cookies(${dbgCookies.length})=${dbgCookies.map(c => c.name).join(',')}`);
+        const dbgBody = await page.evaluate(() => document.body?.innerText?.slice(0, 300) || '').catch(() => '');
+        console.log(`[PAHE DBG] body="${dbgBody.replace(/\n/g, ' ')}"`);
+
         const debugInfo = await page.evaluate(() => {
             const info = {
                 title: document.title,

@@ -3,28 +3,6 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 import json as _json
-import os
-from urllib.parse import urlparse
-
-# curl_cffi emulates Chrome's TLS/JA3 fingerprint, which is what modern
-# Cloudflare bot protection actually checks. Plain requests/cloudscraper
-# now get 403 on anikai.to from datacenter IPs.
-try:
-    from curl_cffi import requests as _cffi_requests
-    _HAS_CFFI = True
-except ImportError:
-    _HAS_CFFI = False
-
-try:
-    import cloudscraper
-    _HAS_CLOUDSCRAPER = True
-except ImportError:
-    _HAS_CLOUDSCRAPER = False
-
-# FlareSolverr sidecar URL (docker-compose service). When set, CF-protected
-# endpoints go through a headless Chrome that solves Turnstile / JS
-# challenges, then we reuse the issued cookies on the curl_cffi session.
-FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 
 app = Flask(__name__)
 CORS(app)
@@ -41,145 +19,16 @@ ENCDEC_DEC_KAI = "https://enc-dec.app/api/dec-kai"
 ENCDEC_DEC_MEGA = "https://enc-dec.app/api/dec-mega"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
-    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://anikai.to/",
-    "Sec-Ch-Ua": '"Chromium";v="131", "Google Chrome";v="131", "Not:A-Brand";v="24"',
-    "Sec-Ch-Ua-Mobile": "?0",
-    "Sec-Ch-Ua-Platform": '"Windows"',
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "same-origin",
-    "Upgrade-Insecure-Requests": "1",
 }
 
 AJAX_HEADERS = {
     **HEADERS,
-    "Accept": "application/json, text/plain, */*",
-    "X-Requested-With": "XMLHttpRequest",
-    "Sec-Fetch-Dest": "empty",
-    "Sec-Fetch-Mode": "cors",
+    "X-Requested-With": "XMLHttpRequest"
 }
-
-
-def _make_scraper():
-    """Return a session object that bypasses Cloudflare.
-
-    Priority:
-      1. curl_cffi — impersonates Chrome's TLS/JA3 fingerprint. This is the
-         ONLY reliable way past modern CF bot-detection from datacenter IPs.
-      2. cloudscraper — solves CF JS challenges (older CF protection).
-      3. plain requests.Session — no CF handling, only works from residential
-         IPs with no CF challenge.
-    """
-    if _HAS_CFFI:
-        # Impersonate Chrome at TLS level. chrome124 is the newest profile
-        # available in curl_cffi 0.7.x. Newer profile names (chrome131 etc.)
-        # require curl_cffi >= 0.8.
-        return _cffi_requests.Session(impersonate="chrome124")
-    if _HAS_CLOUDSCRAPER:
-        return cloudscraper.create_scraper(
-            browser={"browser": "chrome", "platform": "windows", "mobile": False}
-        )
-    return requests.Session()
-
-
-def _scraper_get(session, url, **kwargs):
-    """Wrapper around session.get that normalizes curl_cffi / requests / cloudscraper
-    responses to a common interface (json(), text, raise_for_status, status_code)."""
-    return session.get(url, **kwargs)
-
-
-def _fs_post(payload, timeout_s=70):
-    """Low-level POST to FlareSolverr. Returns parsed JSON dict."""
-    if not FLARESOLVERR_URL:
-        raise RuntimeError("FLARESOLVERR_URL not configured")
-    resp = requests.post(
-        FLARESOLVERR_URL,
-        json=payload,
-        headers={"Content-Type": "application/json"},
-        timeout=timeout_s,
-    )
-    resp.raise_for_status()
-    return resp.json()
-
-
-def _fs_session_create():
-    data = _fs_post({"cmd": "sessions.create"})
-    return data.get("session")
-
-
-def _fs_session_destroy(session_id):
-    try:
-        _fs_post({"cmd": "sessions.destroy", "session": session_id})
-    except Exception:
-        pass
-
-
-def _fs_get(url, session_id=None, timeout_ms=60000):
-    """Wrapper for cmd=request.get. Returns (ok, status, body, cookies, ua, err)."""
-    payload = {"cmd": "request.get", "url": url, "maxTimeout": timeout_ms}
-    if session_id:
-        payload["session"] = session_id
-    data = _fs_post(payload, timeout_s=timeout_ms / 1000 + 10)
-    if data.get("status") != "ok":
-        return {
-            "ok": False,
-            "status": 0,
-            "body": "",
-            "cookies": [],
-            "user_agent": "",
-            "error": data.get("message", "flaresolverr failure"),
-        }
-    solution = data.get("solution", {})
-    return {
-        "ok": True,
-        "status": int(solution.get("status", 0)),
-        "body": solution.get("response", ""),
-        "cookies": solution.get("cookies", []) or [],
-        "user_agent": solution.get("userAgent", ""),
-        "error": None,
-    }
-
-
-def _flaresolverr_fetch_media(home_url, embed_url, media_url, timeout_ms=60000):
-    """Fetch /iframe/media via FlareSolverr using a persistent browser session
-    so Cloudflare sees a realistic navigation sequence:
-      1. Visit anikai.to → CF clearance cookie
-      2. Visit embed iframe page → iframe cookies
-      3. Visit /iframe/media/<id> → content (finally)
-    The WAF rule that blocks direct hits to /iframe/media tends to let this
-    sequence through because the browser history / referer chain looks like
-    a real user watching an episode.
-    """
-    session_id = None
-    try:
-        session_id = _fs_session_create()
-        # Step 1: warm up
-        _fs_get(home_url, session_id=session_id, timeout_ms=timeout_ms)
-        # Step 2: open embed iframe
-        _fs_get(embed_url, session_id=session_id, timeout_ms=timeout_ms)
-        # Step 3: the actual media endpoint
-        return _fs_get(media_url, session_id=session_id, timeout_ms=timeout_ms)
-    finally:
-        if session_id:
-            _fs_session_destroy(session_id)
-
-
-def _attach_flaresolverr_cookies(session, cookies, domain_hint=None):
-    """Copy cookies returned by FlareSolverr into a curl_cffi / requests session."""
-    for c in cookies:
-        try:
-            session.cookies.set(
-                c.get("name"),
-                c.get("value"),
-                domain=c.get("domain") or domain_hint,
-                path=c.get("path") or "/",
-            )
-        except Exception:
-            pass
 
 _V_L_1 = [114, 94, 91, 90, 31, 125, 70, 31, 104, 94, 83, 75, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 77, 31, 88, 86, 75, 87, 74, 93, 17, 92, 80, 82, 16, 72, 94, 83, 75, 90, 77, 72, 87, 86, 75, 90, 18, 9, 6]
 _K_L_1 = 0x3F
@@ -425,11 +274,7 @@ def scrape_home():
 def scrape_anime_info(slug):
     try:
         url = f"{ANIMEKAI_URL}watch/{slug}"
-        # anikai.to/watch/<slug> is Cloudflare-protected; plain requests
-        # receives a stub/empty page from datacenter IPs. Use the scraper.
-        scraper = _make_scraper()
-        scraper.headers.update(HEADERS)
-        response = scraper.get(url, timeout=15)
+        response = requests.get(url, headers=HEADERS, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
@@ -488,14 +333,8 @@ def fetch_episodes(ani_id):
     try:
         encoded = encode_token(ani_id)
         if not encoded: return {"error": "Token encryption failed"}
-
-        scraper = _make_scraper()
-        scraper.headers.update(AJAX_HEADERS)
-        response = scraper.get(
-            ANIMEKAI_EPISODES_URL,
-            params={"ani_id": ani_id, "_": encoded},
-            timeout=15,
-        )
+        
+        response = requests.get(ANIMEKAI_EPISODES_URL, params={"ani_id": ani_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         response.raise_for_status()
         html = response.json().get("result", "")
         if not html: return []
@@ -521,14 +360,8 @@ def fetch_servers(ep_token):
     try:
         encoded = encode_token(ep_token)
         if not encoded: return {"error": "Token encryption failed"}
-
-        scraper = _make_scraper()
-        scraper.headers.update(AJAX_HEADERS)
-        response = scraper.get(
-            ANIMEKAI_SERVERS_URL,
-            params={"token": ep_token, "_": encoded},
-            timeout=15,
-        )
+        
+        response = requests.get(ANIMEKAI_SERVERS_URL, params={"token": ep_token, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         response.raise_for_status()
         html = response.json().get("result", "")
         soup = BeautifulSoup(html, "html.parser")
@@ -555,114 +388,20 @@ def resolve_source(link_id):
         encoded = encode_token(link_id)
         if not encoded: return {"error": "Token encryption failed"}
 
-        # cloudscraper handles Cloudflare JS challenges and sets realistic TLS
-        # fingerprint; plain requests gets 403 from anikai.to/iframe/media.
-        session = _make_scraper()
-        session.headers.update(HEADERS)
-
-        # Warm a landing page so any CF clearance cookies are issued.
-        try:
-            session.get("https://anikai.to/", timeout=15)
-        except Exception:
-            pass
-
-        resp = session.get(
-            ANIMEKAI_LINKS_VIEW_URL,
-            params={"id": link_id, "_": encoded},
-            headers=AJAX_HEADERS,
-            timeout=15,
-        )
+        resp = requests.get(ANIMEKAI_LINKS_VIEW_URL, params={"id": link_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         resp.raise_for_status()
         encrypted_result = resp.json().get("result", "")
-
+        
         embed_data = decode_kai(encrypted_result)
         if not embed_data: return {"error": "Embed decryption failed"}
         embed_url = embed_data.get("url", "")
-        if not embed_url:
-            return {"error": f"No embed URL found; decoded keys={list(embed_data.keys())}; sample={_json.dumps(embed_data)[:300]}"}
-
-        app.logger.info(f"Anikai decoded embed_data keys={list(embed_data.keys())} url={embed_url}")
-
-        # Load the embed iframe so its cookies / CF-clearance are attached to
-        # the session before we hit /media.
-        try:
-            session.get(
-                embed_url,
-                headers={
-                    **HEADERS,
-                    "Referer": "https://anikai.to/",
-                    "Sec-Fetch-Dest": "iframe",
-                    "Sec-Fetch-Mode": "navigate",
-                    "Sec-Fetch-Site": "same-origin",
-                },
-                timeout=15,
-            )
-        except Exception:
-            pass
+        if not embed_url: return {"error": "No embed URL found"}
 
         video_id = embed_url.rstrip("/").split("/")[-1]
         embed_base = embed_url.rsplit("/e/", 1)[0] if "/e/" in embed_url else embed_url.rsplit("/", 1)[0]
-
-        parsed_embed = urlparse(embed_url)
-        embed_origin = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
-
-        media_url = f"{embed_base}/media/{video_id}"
-        media_headers = {
-            **AJAX_HEADERS,
-            "Referer": embed_url,
-            "Origin": embed_origin,
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-        }
-
-        encrypted_media = ""
-        try:
-            media_resp = session.get(media_url, headers=media_headers, timeout=15)
-            media_resp.raise_for_status()
-            encrypted_media = media_resp.json().get("result", "")
-        except Exception as direct_err:
-            # /iframe/media is protected by Cloudflare Turnstile + WAF "Block"
-            # from datacenter IPs. Use FlareSolverr with a warm-up chain so
-            # Cloudflare sees a realistic navigation sequence.
-            if not FLARESOLVERR_URL:
-                return {"error": f"/iframe/media blocked and FLARESOLVERR_URL not set: {direct_err}"}
-
-            fs = _flaresolverr_fetch_media(
-                home_url="https://anikai.to/",
-                embed_url=embed_url,
-                media_url=media_url,
-            )
-            if not fs["ok"]:
-                return {"error": f"flaresolverr failed: {fs['error']}"}
-            if fs["status"] != 200:
-                return {"error": f"flaresolverr got HTTP {fs['status']} from /iframe/media"}
-
-            raw_body = fs["body"] or ""
-
-            # Quick sanity check — if CF served us an 'Access denied' page
-            # despite 200 OK, surface that clearly instead of a cryptic JSON
-            # parse error.
-            if "Access denied" in raw_body or "cf-error" in raw_body:
-                return {"error": "flaresolverr got Cloudflare 'Access denied' body (WAF block on datacenter IP)"}
-
-            # FlareSolverr wraps JSON responses in <html><body><pre>{json}</pre>
-            cleaned = raw_body
-            pre_start = cleaned.find("<pre")
-            if pre_start != -1:
-                gt = cleaned.find(">", pre_start)
-                if gt != -1:
-                    cleaned = cleaned[gt + 1:]
-                    pre_end = cleaned.find("</pre>")
-                    if pre_end != -1:
-                        cleaned = cleaned[:pre_end]
-            try:
-                encrypted_media = _json.loads(cleaned).get("result", "")
-            except Exception as e:
-                return {"error": f"flaresolverr body not JSON: {e}; sample={cleaned[:200]}"}
-
-        if not encrypted_media:
-            return {"error": "Empty encrypted media payload"}
+        media_resp = requests.get(f"{embed_base}/media/{video_id}", headers=HEADERS, timeout=15)
+        media_resp.raise_for_status()
+        encrypted_media = media_resp.json().get("result", "")
 
         final_data = decode_mega(encrypted_media)
         if not final_data: return {"error": "Media decryption failed"}

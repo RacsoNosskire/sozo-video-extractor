@@ -22,32 +22,9 @@ services:
     restart: unless-stopped
     ports:
       - "3233:5000"
-    environment:
-      - FLARESOLVERR_URL=http://flaresolverr:8191/v1
-    depends_on:
-      - flaresolverr
     deploy:
       resources:
         limits:
           memory: 512M
         reservations:
           memory: 128M
-
-  # Solves Cloudflare Turnstile / JS challenges on anikai.to/iframe/media
-  # using a headless Chrome. Returns cookies the anikai-api can then reuse.
-  flaresolverr:
-    image: ghcr.io/flaresolverr/flaresolverr:latest
-    container_name: sozo-flaresolverr
-    restart: unless-stopped
-    environment:
-      - LOG_LEVEL=info
-      - CAPTCHA_SOLVER=none
-      - TZ=Europe/Stockholm
-    ports:
-      - "8191:8191"
-    deploy:
-      resources:
-        limits:
-          memory: 1G
-        reservations:
-          memory: 512M

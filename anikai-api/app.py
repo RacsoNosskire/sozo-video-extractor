@@ -578,7 +578,10 @@ def resolve_source(link_id):
         embed_data = decode_kai(encrypted_result)
         if not embed_data: return {"error": "Embed decryption failed"}
         embed_url = embed_data.get("url", "")
-        if not embed_url: return {"error": "No embed URL found"}
+        if not embed_url:
+            return {"error": f"No embed URL found; decoded keys={list(embed_data.keys())}; sample={_json.dumps(embed_data)[:300]}"}
+
+        app.logger.info(f"Anikai decoded embed_data keys={list(embed_data.keys())} url={embed_url}")
 
         # Load the embed iframe so its cookies / CF-clearance are attached to
         # the session before we hit /media.

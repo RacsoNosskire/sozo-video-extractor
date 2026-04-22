@@ -5,6 +5,12 @@ from bs4 import BeautifulSoup
 import json as _json
 from urllib.parse import urlparse
 
+try:
+    import cloudscraper
+    _HAS_CLOUDSCRAPER = True
+except ImportError:
+    _HAS_CLOUDSCRAPER = False
+
 app = Flask(__name__)
 CORS(app)
 
@@ -20,16 +26,37 @@ ENCDEC_DEC_KAI = "https://enc-dec.app/api/dec-kai"
 ENCDEC_DEC_MEGA = "https://enc-dec.app/api/dec-mega"
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
     "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
     "Referer": "https://anikai.to/",
+    "Sec-Ch-Ua": '"Chromium";v="131", "Google Chrome";v="131", "Not:A-Brand";v="24"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
+    "Upgrade-Insecure-Requests": "1",
 }
 
 AJAX_HEADERS = {
     **HEADERS,
-    "X-Requested-With": "XMLHttpRequest"
+    "Accept": "application/json, text/plain, */*",
+    "X-Requested-With": "XMLHttpRequest",
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
 }
+
+
+def _make_scraper():
+    """Return a cloudscraper.Session if available (handles Cloudflare JS
+    challenges automatically), otherwise fall back to a plain requests Session."""
+    if _HAS_CLOUDSCRAPER:
+        return cloudscraper.create_scraper(
+            browser={"browser": "chrome", "platform": "windows", "mobile": False}
+        )
+    return requests.Session()
 
 _V_L_1 = [114, 94, 91, 90, 31, 125, 70, 31, 104, 94, 83, 75, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 77, 31, 88, 86, 75, 87, 74, 93, 17, 92, 80, 82, 16, 72, 94, 83, 75, 90, 77, 72, 87, 86, 75, 90, 18, 9, 6]
 _K_L_1 = 0x3F
@@ -389,10 +416,16 @@ def resolve_source(link_id):
         encoded = encode_token(link_id)
         if not encoded: return {"error": "Token encryption failed"}
 
-        # Reuse a session so cookies set by /ajax/links/view and the embed
-        # iframe page (CloudFlare / anti-bot) follow the /iframe/media request.
-        session = requests.Session()
+        # cloudscraper handles Cloudflare JS challenges and sets realistic TLS
+        # fingerprint; plain requests gets 403 from anikai.to/iframe/media.
+        session = _make_scraper()
         session.headers.update(HEADERS)
+
+        # Warm a landing page so any CF clearance cookies are issued.
+        try:
+            session.get("https://anikai.to/", timeout=15)
+        except Exception:
+            pass
 
         resp = session.get(
             ANIMEKAI_LINKS_VIEW_URL,
@@ -408,12 +441,18 @@ def resolve_source(link_id):
         embed_url = embed_data.get("url", "")
         if not embed_url: return {"error": "No embed URL found"}
 
-        # Pre-warm the embed page so any cookies it sets are carried forward
-        # to /iframe/media. Failures here are non-fatal; we still try /media.
+        # Load the embed iframe so its cookies / CF-clearance are attached to
+        # the session before we hit /media.
         try:
             session.get(
                 embed_url,
-                headers={**HEADERS, "Referer": "https://anikai.to/"},
+                headers={
+                    **HEADERS,
+                    "Referer": "https://anikai.to/",
+                    "Sec-Fetch-Dest": "iframe",
+                    "Sec-Fetch-Mode": "navigate",
+                    "Sec-Fetch-Site": "same-origin",
+                },
                 timeout=15,
             )
         except Exception:
@@ -425,14 +464,13 @@ def resolve_source(link_id):
         parsed_embed = urlparse(embed_url)
         embed_origin = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
 
-        # anikai.to/megacloud now returns 403 unless Referer/Origin match the
-        # embed page exactly and the request looks like a browser XHR.
         media_headers = {
-            **HEADERS,
-            "Accept": "application/json, text/plain, */*",
+            **AJAX_HEADERS,
             "Referer": embed_url,
             "Origin": embed_origin,
-            "X-Requested-With": "XMLHttpRequest",
+            "Sec-Fetch-Dest": "empty",
+            "Sec-Fetch-Mode": "cors",
+            "Sec-Fetch-Site": "same-origin",
         }
         media_resp = session.get(
             f"{embed_base}/media/{video_id}",

@@ -92,33 +92,38 @@ def _scraper_get(session, url, **kwargs):
     return session.get(url, **kwargs)
 
 
-def _flaresolverr_get(url, referer=None, user_agent=None, session_id=None, timeout_ms=60000):
-    """Fetch a URL through FlareSolverr. Returns a dict:
-      {
-        "ok": bool,
-        "status": int,
-        "body": str,
-        "cookies": list[dict],     # {name, value, domain, path, ...}
-        "user_agent": str,
-        "error": str | None,
-      }
-    Raises RuntimeError if FLARESOLVERR_URL is not configured.
-    """
+def _fs_post(payload, timeout_s=70):
+    """Low-level POST to FlareSolverr. Returns parsed JSON dict."""
     if not FLARESOLVERR_URL:
         raise RuntimeError("FLARESOLVERR_URL not configured")
+    resp = requests.post(
+        FLARESOLVERR_URL,
+        json=payload,
+        headers={"Content-Type": "application/json"},
+        timeout=timeout_s,
+    )
+    resp.raise_for_status()
+    return resp.json()
 
-    payload = {
-        "cmd": "request.get",
-        "url": url,
-        "maxTimeout": timeout_ms,
-    }
+
+def _fs_session_create():
+    data = _fs_post({"cmd": "sessions.create"})
+    return data.get("session")
+
+
+def _fs_session_destroy(session_id):
+    try:
+        _fs_post({"cmd": "sessions.destroy", "session": session_id})
+    except Exception:
+        pass
+
+
+def _fs_get(url, session_id=None, timeout_ms=60000):
+    """Wrapper for cmd=request.get. Returns (ok, status, body, cookies, ua, err)."""
+    payload = {"cmd": "request.get", "url": url, "maxTimeout": timeout_ms}
     if session_id:
         payload["session"] = session_id
-    headers = {"Content-Type": "application/json"}
-
-    resp = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=timeout_ms / 1000 + 5)
-    resp.raise_for_status()
-    data = resp.json()
+    data = _fs_post(payload, timeout_s=timeout_ms / 1000 + 10)
     if data.get("status") != "ok":
         return {
             "ok": False,
@@ -137,6 +142,30 @@ def _flaresolverr_get(url, referer=None, user_agent=None, session_id=None, timeo
         "user_agent": solution.get("userAgent", ""),
         "error": None,
     }
+
+
+def _flaresolverr_fetch_media(home_url, embed_url, media_url, timeout_ms=60000):
+    """Fetch /iframe/media via FlareSolverr using a persistent browser session
+    so Cloudflare sees a realistic navigation sequence:
+      1. Visit anikai.to → CF clearance cookie
+      2. Visit embed iframe page → iframe cookies
+      3. Visit /iframe/media/<id> → content (finally)
+    The WAF rule that blocks direct hits to /iframe/media tends to let this
+    sequence through because the browser history / referer chain looks like
+    a real user watching an episode.
+    """
+    session_id = None
+    try:
+        session_id = _fs_session_create()
+        # Step 1: warm up
+        _fs_get(home_url, session_id=session_id, timeout_ms=timeout_ms)
+        # Step 2: open embed iframe
+        _fs_get(embed_url, session_id=session_id, timeout_ms=timeout_ms)
+        # Step 3: the actual media endpoint
+        return _fs_get(media_url, session_id=session_id, timeout_ms=timeout_ms)
+    finally:
+        if session_id:
+            _fs_session_destroy(session_id)
 
 
 def _attach_flaresolverr_cookies(session, cookies, domain_hint=None):
@@ -590,21 +619,31 @@ def resolve_source(link_id):
             media_resp.raise_for_status()
             encrypted_media = media_resp.json().get("result", "")
         except Exception as direct_err:
-            # /iframe/media is protected by Cloudflare Turnstile from datacenter
-            # IPs. Fall back to FlareSolverr (headless Chrome that solves the
-            # challenge and hands us back cookies).
+            # /iframe/media is protected by Cloudflare Turnstile + WAF "Block"
+            # from datacenter IPs. Use FlareSolverr with a warm-up chain so
+            # Cloudflare sees a realistic navigation sequence.
             if not FLARESOLVERR_URL:
                 return {"error": f"/iframe/media blocked and FLARESOLVERR_URL not set: {direct_err}"}
 
-            fs = _flaresolverr_get(media_url, referer=embed_url)
+            fs = _flaresolverr_fetch_media(
+                home_url="https://anikai.to/",
+                embed_url=embed_url,
+                media_url=media_url,
+            )
             if not fs["ok"]:
                 return {"error": f"flaresolverr failed: {fs['error']}"}
             if fs["status"] != 200:
                 return {"error": f"flaresolverr got HTTP {fs['status']} from /iframe/media"}
 
-            # FlareSolverr wraps JSON responses in <html><body><pre>{json}</pre>...
-            # — strip that out.
-            raw_body = fs["body"]
+            raw_body = fs["body"] or ""
+
+            # Quick sanity check — if CF served us an 'Access denied' page
+            # despite 200 OK, surface that clearly instead of a cryptic JSON
+            # parse error.
+            if "Access denied" in raw_body or "cf-error" in raw_body:
+                return {"error": "flaresolverr got Cloudflare 'Access denied' body (WAF block on datacenter IP)"}
+
+            # FlareSolverr wraps JSON responses in <html><body><pre>{json}</pre>
             cleaned = raw_body
             pre_start = cleaned.find("<pre")
             if pre_start != -1:

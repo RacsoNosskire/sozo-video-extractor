@@ -5,6 +5,15 @@ from bs4 import BeautifulSoup
 import json as _json
 from urllib.parse import urlparse
 
+# curl_cffi emulates Chrome's TLS/JA3 fingerprint, which is what modern
+# Cloudflare bot protection actually checks. Plain requests/cloudscraper
+# now get 403 on anikai.to from datacenter IPs.
+try:
+    from curl_cffi import requests as _cffi_requests
+    _HAS_CFFI = True
+except ImportError:
+    _HAS_CFFI = False
+
 try:
     import cloudscraper
     _HAS_CLOUDSCRAPER = True
@@ -50,13 +59,29 @@ AJAX_HEADERS = {
 
 
 def _make_scraper():
-    """Return a cloudscraper.Session if available (handles Cloudflare JS
-    challenges automatically), otherwise fall back to a plain requests Session."""
+    """Return a session object that bypasses Cloudflare.
+
+    Priority:
+      1. curl_cffi — impersonates Chrome's TLS/JA3 fingerprint. This is the
+         ONLY reliable way past modern CF bot-detection from datacenter IPs.
+      2. cloudscraper — solves CF JS challenges (older CF protection).
+      3. plain requests.Session — no CF handling, only works from residential
+         IPs with no CF challenge.
+    """
+    if _HAS_CFFI:
+        # impersonate Chrome 131 at TLS level
+        return _cffi_requests.Session(impersonate="chrome131")
     if _HAS_CLOUDSCRAPER:
         return cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}
         )
     return requests.Session()
+
+
+def _scraper_get(session, url, **kwargs):
+    """Wrapper around session.get that normalizes curl_cffi / requests / cloudscraper
+    responses to a common interface (json(), text, raise_for_status, status_code)."""
+    return session.get(url, **kwargs)
 
 _V_L_1 = [114, 94, 91, 90, 31, 125, 70, 31, 104, 94, 83, 75, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 77, 31, 88, 86, 75, 87, 74, 93, 17, 92, 80, 82, 16, 72, 94, 83, 75, 90, 77, 72, 87, 86, 75, 90, 18, 9, 6]
 _K_L_1 = 0x3F
@@ -302,7 +327,11 @@ def scrape_home():
 def scrape_anime_info(slug):
     try:
         url = f"{ANIMEKAI_URL}watch/{slug}"
-        response = requests.get(url, headers=HEADERS, timeout=15)
+        # anikai.to/watch/<slug> is Cloudflare-protected; plain requests
+        # receives a stub/empty page from datacenter IPs. Use the scraper.
+        scraper = _make_scraper()
+        scraper.headers.update(HEADERS)
+        response = scraper.get(url, timeout=15)
         response.raise_for_status()
         soup = BeautifulSoup(response.text, "html.parser")
 
@@ -361,8 +390,14 @@ def fetch_episodes(ani_id):
     try:
         encoded = encode_token(ani_id)
         if not encoded: return {"error": "Token encryption failed"}
-        
-        response = requests.get(ANIMEKAI_EPISODES_URL, params={"ani_id": ani_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
+
+        scraper = _make_scraper()
+        scraper.headers.update(AJAX_HEADERS)
+        response = scraper.get(
+            ANIMEKAI_EPISODES_URL,
+            params={"ani_id": ani_id, "_": encoded},
+            timeout=15,
+        )
         response.raise_for_status()
         html = response.json().get("result", "")
         if not html: return []
@@ -388,8 +423,14 @@ def fetch_servers(ep_token):
     try:
         encoded = encode_token(ep_token)
         if not encoded: return {"error": "Token encryption failed"}
-        
-        response = requests.get(ANIMEKAI_SERVERS_URL, params={"token": ep_token, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
+
+        scraper = _make_scraper()
+        scraper.headers.update(AJAX_HEADERS)
+        response = scraper.get(
+            ANIMEKAI_SERVERS_URL,
+            params={"token": ep_token, "_": encoded},
+            timeout=15,
+        )
         response.raise_for_status()
         html = response.json().get("result", "")
         soup = BeautifulSoup(html, "html.parser")

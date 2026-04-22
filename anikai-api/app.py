@@ -117,7 +117,7 @@ def scrape_most_searched():
                 })
         return results
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def search_anime(keyword):
     try:
@@ -170,7 +170,7 @@ def search_anime(keyword):
                 })
         return results
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def scrape_home():
     try:
@@ -269,7 +269,7 @@ def scrape_home():
 
         return {"banner": banner, "latest_updates": latest, "top_trending": trending}
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def scrape_anime_info(slug):
     try:
@@ -327,12 +327,12 @@ def scrape_anime_info(slug):
             "seasons": seasons,
         }
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def fetch_episodes(ani_id):
     try:
         encoded = encode_token(ani_id)
-        if not encoded: return {"error": "Token encryption failed"}, 500
+        if not encoded: return {"error": "Token encryption failed"}
         
         response = requests.get(ANIMEKAI_EPISODES_URL, params={"ani_id": ani_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         response.raise_for_status()
@@ -354,12 +354,12 @@ def fetch_episodes(ani_id):
             })
         return episodes
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def fetch_servers(ep_token):
     try:
         encoded = encode_token(ep_token)
-        if not encoded: return {"error": "Token encryption failed"}, 500
+        if not encoded: return {"error": "Token encryption failed"}
         
         response = requests.get(ANIMEKAI_SERVERS_URL, params={"token": ep_token, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         response.raise_for_status()
@@ -381,21 +381,21 @@ def fetch_servers(ep_token):
             "servers": servers
         }
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 def resolve_source(link_id):
     try:
         encoded = encode_token(link_id)
-        if not encoded: return {"error": "Token encryption failed"}, 500
+        if not encoded: return {"error": "Token encryption failed"}
 
         resp = requests.get(ANIMEKAI_LINKS_VIEW_URL, params={"id": link_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
         resp.raise_for_status()
         encrypted_result = resp.json().get("result", "")
         
         embed_data = decode_kai(encrypted_result)
-        if not embed_data: return {"error": "Embed decryption failed"}, 500
+        if not embed_data: return {"error": "Embed decryption failed"}
         embed_url = embed_data.get("url", "")
-        if not embed_url: return {"error": "No embed URL found"}, 500
+        if not embed_url: return {"error": "No embed URL found"}
 
         video_id = embed_url.rstrip("/").split("/")[-1]
         embed_base = embed_url.rsplit("/e/", 1)[0] if "/e/" in embed_url else embed_url.rsplit("/", 1)[0]
@@ -404,7 +404,7 @@ def resolve_source(link_id):
         encrypted_media = media_resp.json().get("result", "")
 
         final_data = decode_mega(encrypted_media)
-        if not final_data: return {"error": "Media decryption failed"}, 500
+        if not final_data: return {"error": "Media decryption failed"}
 
         return {
             "embed_url": embed_url,
@@ -414,7 +414,7 @@ def resolve_source(link_id):
             "download": final_data.get("download", ""),
         }
     except Exception as e:
-        return {"error": str(e)}, 500
+        return {"error": str(e)}
 
 @app.route("/", methods=["GET"])
 def index():

@@ -3,6 +3,7 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 import json as _json
+import os
 from urllib.parse import urlparse
 
 # curl_cffi emulates Chrome's TLS/JA3 fingerprint, which is what modern
@@ -19,6 +20,11 @@ try:
     _HAS_CLOUDSCRAPER = True
 except ImportError:
     _HAS_CLOUDSCRAPER = False
+
+# FlareSolverr sidecar URL (docker-compose service). When set, CF-protected
+# endpoints go through a headless Chrome that solves Turnstile / JS
+# challenges, then we reuse the issued cookies on the curl_cffi session.
+FLARESOLVERR_URL = os.environ.get("FLARESOLVERR_URL", "").rstrip("/")
 
 app = Flask(__name__)
 CORS(app)
@@ -84,6 +90,67 @@ def _scraper_get(session, url, **kwargs):
     """Wrapper around session.get that normalizes curl_cffi / requests / cloudscraper
     responses to a common interface (json(), text, raise_for_status, status_code)."""
     return session.get(url, **kwargs)
+
+
+def _flaresolverr_get(url, referer=None, user_agent=None, session_id=None, timeout_ms=60000):
+    """Fetch a URL through FlareSolverr. Returns a dict:
+      {
+        "ok": bool,
+        "status": int,
+        "body": str,
+        "cookies": list[dict],     # {name, value, domain, path, ...}
+        "user_agent": str,
+        "error": str | None,
+      }
+    Raises RuntimeError if FLARESOLVERR_URL is not configured.
+    """
+    if not FLARESOLVERR_URL:
+        raise RuntimeError("FLARESOLVERR_URL not configured")
+
+    payload = {
+        "cmd": "request.get",
+        "url": url,
+        "maxTimeout": timeout_ms,
+    }
+    if session_id:
+        payload["session"] = session_id
+    headers = {"Content-Type": "application/json"}
+
+    resp = requests.post(FLARESOLVERR_URL, json=payload, headers=headers, timeout=timeout_ms / 1000 + 5)
+    resp.raise_for_status()
+    data = resp.json()
+    if data.get("status") != "ok":
+        return {
+            "ok": False,
+            "status": 0,
+            "body": "",
+            "cookies": [],
+            "user_agent": "",
+            "error": data.get("message", "flaresolverr failure"),
+        }
+    solution = data.get("solution", {})
+    return {
+        "ok": True,
+        "status": int(solution.get("status", 0)),
+        "body": solution.get("response", ""),
+        "cookies": solution.get("cookies", []) or [],
+        "user_agent": solution.get("userAgent", ""),
+        "error": None,
+    }
+
+
+def _attach_flaresolverr_cookies(session, cookies, domain_hint=None):
+    """Copy cookies returned by FlareSolverr into a curl_cffi / requests session."""
+    for c in cookies:
+        try:
+            session.cookies.set(
+                c.get("name"),
+                c.get("value"),
+                domain=c.get("domain") or domain_hint,
+                path=c.get("path") or "/",
+            )
+        except Exception:
+            pass
 
 _V_L_1 = [114, 94, 91, 90, 31, 125, 70, 31, 104, 94, 83, 75, 90, 90, 90, 90, 90, 90, 90, 90, 90, 90, 77, 31, 88, 86, 75, 87, 74, 93, 17, 92, 80, 82, 16, 72, 94, 83, 75, 90, 77, 72, 87, 86, 75, 90, 18, 9, 6]
 _K_L_1 = 0x3F
@@ -507,6 +574,7 @@ def resolve_source(link_id):
         parsed_embed = urlparse(embed_url)
         embed_origin = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
 
+        media_url = f"{embed_base}/media/{video_id}"
         media_headers = {
             **AJAX_HEADERS,
             "Referer": embed_url,
@@ -515,13 +583,44 @@ def resolve_source(link_id):
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
         }
-        media_resp = session.get(
-            f"{embed_base}/media/{video_id}",
-            headers=media_headers,
-            timeout=15,
-        )
-        media_resp.raise_for_status()
-        encrypted_media = media_resp.json().get("result", "")
+
+        encrypted_media = ""
+        try:
+            media_resp = session.get(media_url, headers=media_headers, timeout=15)
+            media_resp.raise_for_status()
+            encrypted_media = media_resp.json().get("result", "")
+        except Exception as direct_err:
+            # /iframe/media is protected by Cloudflare Turnstile from datacenter
+            # IPs. Fall back to FlareSolverr (headless Chrome that solves the
+            # challenge and hands us back cookies).
+            if not FLARESOLVERR_URL:
+                return {"error": f"/iframe/media blocked and FLARESOLVERR_URL not set: {direct_err}"}
+
+            fs = _flaresolverr_get(media_url, referer=embed_url)
+            if not fs["ok"]:
+                return {"error": f"flaresolverr failed: {fs['error']}"}
+            if fs["status"] != 200:
+                return {"error": f"flaresolverr got HTTP {fs['status']} from /iframe/media"}
+
+            # FlareSolverr wraps JSON responses in <html><body><pre>{json}</pre>...
+            # — strip that out.
+            raw_body = fs["body"]
+            cleaned = raw_body
+            pre_start = cleaned.find("<pre")
+            if pre_start != -1:
+                gt = cleaned.find(">", pre_start)
+                if gt != -1:
+                    cleaned = cleaned[gt + 1:]
+                    pre_end = cleaned.find("</pre>")
+                    if pre_end != -1:
+                        cleaned = cleaned[:pre_end]
+            try:
+                encrypted_media = _json.loads(cleaned).get("result", "")
+            except Exception as e:
+                return {"error": f"flaresolverr body not JSON: {e}; sample={cleaned[:200]}"}
+
+        if not encrypted_media:
+            return {"error": "Empty encrypted media payload"}
 
         final_data = decode_mega(encrypted_media)
         if not final_data: return {"error": "Media decryption failed"}

@@ -69,8 +69,10 @@ def _make_scraper():
          IPs with no CF challenge.
     """
     if _HAS_CFFI:
-        # impersonate Chrome 131 at TLS level
-        return _cffi_requests.Session(impersonate="chrome131")
+        # Impersonate Chrome at TLS level. chrome124 is the newest profile
+        # available in curl_cffi 0.7.x. Newer profile names (chrome131 etc.)
+        # require curl_cffi >= 0.8.
+        return _cffi_requests.Session(impersonate="chrome124")
     if _HAS_CLOUDSCRAPER:
         return cloudscraper.create_scraper(
             browser={"browser": "chrome", "platform": "windows", "mobile": False}

@@ -3,6 +3,7 @@ from flask_cors import CORS
 import requests
 from bs4 import BeautifulSoup
 import json as _json
+from urllib.parse import urlparse
 
 app = Flask(__name__)
 CORS(app)
@@ -388,18 +389,56 @@ def resolve_source(link_id):
         encoded = encode_token(link_id)
         if not encoded: return {"error": "Token encryption failed"}
 
-        resp = requests.get(ANIMEKAI_LINKS_VIEW_URL, params={"id": link_id, "_": encoded}, headers=AJAX_HEADERS, timeout=15)
+        # Reuse a session so cookies set by /ajax/links/view and the embed
+        # iframe page (CloudFlare / anti-bot) follow the /iframe/media request.
+        session = requests.Session()
+        session.headers.update(HEADERS)
+
+        resp = session.get(
+            ANIMEKAI_LINKS_VIEW_URL,
+            params={"id": link_id, "_": encoded},
+            headers=AJAX_HEADERS,
+            timeout=15,
+        )
         resp.raise_for_status()
         encrypted_result = resp.json().get("result", "")
-        
+
         embed_data = decode_kai(encrypted_result)
         if not embed_data: return {"error": "Embed decryption failed"}
         embed_url = embed_data.get("url", "")
         if not embed_url: return {"error": "No embed URL found"}
 
+        # Pre-warm the embed page so any cookies it sets are carried forward
+        # to /iframe/media. Failures here are non-fatal; we still try /media.
+        try:
+            session.get(
+                embed_url,
+                headers={**HEADERS, "Referer": "https://anikai.to/"},
+                timeout=15,
+            )
+        except Exception:
+            pass
+
         video_id = embed_url.rstrip("/").split("/")[-1]
         embed_base = embed_url.rsplit("/e/", 1)[0] if "/e/" in embed_url else embed_url.rsplit("/", 1)[0]
-        media_resp = requests.get(f"{embed_base}/media/{video_id}", headers=HEADERS, timeout=15)
+
+        parsed_embed = urlparse(embed_url)
+        embed_origin = f"{parsed_embed.scheme}://{parsed_embed.netloc}"
+
+        # anikai.to/megacloud now returns 403 unless Referer/Origin match the
+        # embed page exactly and the request looks like a browser XHR.
+        media_headers = {
+            **HEADERS,
+            "Accept": "application/json, text/plain, */*",
+            "Referer": embed_url,
+            "Origin": embed_origin,
+            "X-Requested-With": "XMLHttpRequest",
+        }
+        media_resp = session.get(
+            f"{embed_base}/media/{video_id}",
+            headers=media_headers,
+            timeout=15,
+        )
         media_resp.raise_for_status()
         encrypted_media = media_resp.json().get("result", "")
 

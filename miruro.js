@@ -34,13 +34,14 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
   const cached = getCached(key);
   if (cached) {
     console.log(`[MIRURO] cache hit ${key}`);
-    return { videoUrl: cached.url, referer: cached.referer, qualities: cached.qualities || [] };
+    return { videoUrl: cached.url, referer: cached.referer, qualities: cached.qualities || [], subtitles: cached.subtitles || [] };
   }
 
   const page = await browser.newPage();
   try {
     await page.setUserAgent(UA);
     let m3u8 = '';
+    let subUrl = '';
     const client = await page.target().createCDPSession();
     await client.send('Network.enable');
     client.on('Network.requestWillBeSent', (params) => {
@@ -49,6 +50,11 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
       if (!m3u8 && /\.m3u8(\?|$)/i.test(u) && !/\.vtt|thumbnail/i.test(u)) {
         m3u8 = u;
         console.log(`[MIRURO] m3u8 ${u.slice(0, 90)}`);
+      }
+      // Soft subtitle track (Miruro serves e.g. .../sub.vtt for sub content).
+      if (!subUrl && /\.vtt(\?|$)/i.test(u) && !/thumbnail/i.test(u)) {
+        subUrl = u;
+        console.log(`[MIRURO] sub ${u.slice(0, 90)}`);
       }
     });
 
@@ -66,12 +72,20 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
       return null;
     }
 
-    // Fetch the master playlist server-side is unreliable (undici TLS is blocked
-    // by the CDN), so return the master URL directly; ExoPlayer parses variants.
+    // The subtitle .vtt often loads a beat after the playlist — give it a short
+    // grace window so we don't miss it.
+    const subStart = Date.now();
+    while (!subUrl && Date.now() - subStart < 6000) {
+      await new Promise(r => setTimeout(r, 300));
+    }
+
+    // Fetching the playlist server-side is unreliable (undici TLS is blocked by
+    // the CDN), so return the master URL directly; ExoPlayer parses variants.
     const referer = `${MIRURO_HOST}/`;
-    const result = { url: m3u8, referer, qualities: [], ts: Date.now() };
+    const subtitles = subUrl ? [{ url: subUrl, lang: 'English' }] : [];
+    const result = { url: m3u8, referer, qualities: [], subtitles, ts: Date.now() };
     streamCache.set(key, result);
-    return { videoUrl: m3u8, referer, qualities: [] };
+    return { videoUrl: m3u8, referer, qualities: [], subtitles };
   } finally {
     await page.close().catch(() => {});
   }

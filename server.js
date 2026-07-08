@@ -712,6 +712,40 @@ app.get('/extract', async (req, res) => {
     }
 });
 
+// ── Miruro (AniList-native, browser-driven) ─────────────────────────
+const { resolveMiruroStream } = require('./miruro');
+
+app.get('/miruro/stream', async (req, res) => {
+    const anilistId = req.query.anilistId;
+    const ep = parseInt(req.query.ep, 10) || 1;
+    const type = (req.query.type === 'dub') ? 'dub' : 'sub';
+    if (!anilistId) return res.status(400).json({ status: 'error', error: 'Missing anilistId' });
+
+    const overallTimeout = setTimeout(() => {
+        if (!res.headersSent) res.status(504).json({ status: 'error', error: 'Extractor timeout' });
+    }, 70000);
+    res.on('finish', () => clearTimeout(overallTimeout));
+    res.on('close', () => clearTimeout(overallTimeout));
+
+    try {
+        const br = await getBrowser();
+        const result = await resolveMiruroStream(br, anilistId, ep, type);
+        if (result && result.videoUrl) {
+            res.json({
+                status: 'ok',
+                videoUrl: result.videoUrl,
+                referer: result.referer,
+                qualities: result.qualities || [],
+            });
+        } else {
+            res.status(404).json({ status: 'error', error: 'No stream found' });
+        }
+    } catch (e) {
+        console.error(`[MIRURO ERROR] ${e.message}`);
+        if (!res.headersSent) res.status(500).json({ status: 'error', error: e.message });
+    }
+});
+
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });
 });

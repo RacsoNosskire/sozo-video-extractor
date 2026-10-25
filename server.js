@@ -745,6 +745,8 @@ app.get('/miruro/stream', async (req, res) => {
                 referer: result.referer,
                 qualities: result.qualities || [],
                 subtitles: result.subtitles || [],
+                // Intro/outro of this exact video, seconds: [{kind:'op'|'ed', start, end}].
+                skips: result.skips || [],
             });
         } else {
             res.status(404).json({ status: 'error', error: 'No stream found' });

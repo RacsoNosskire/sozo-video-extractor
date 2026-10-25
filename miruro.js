@@ -82,10 +82,19 @@ function pickCandidates(play, type) {
       for (const server of p.servers || []) {
         for (const stream of server.streams || []) {
           if (stream.format !== 'hls' || !stream.url) continue;
-          out.push({ track: trackName, provider: p.provider, server, stream, subtitles: p.subtitles || [] });
+          out.push({ track: trackName, provider: p.provider, server, stream, subtitles: p.subtitles || [], skips: skipsOf(p) });
         }
       }
     }
+  }
+  return out;
+}
+
+// The provider's intro/outro (seconds) for this episode as [{kind:'op'|'ed', start, end}].
+function skipsOf(p) {
+  const out = [];
+  for (const [kind, z] of [['op', p.intro], ['ed', p.outro]]) {
+    if (z && Number.isFinite(z.start) && Number.isFinite(z.end) && z.end > z.start) out.push({ kind, start: z.start, end: z.end });
   }
   return out;
 }
@@ -112,7 +121,7 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
   const cached = getCached(key);
   if (cached) {
     console.log(`[MIRURO] cache hit ${key}`);
-    return { videoUrl: cached.url, referer: cached.referer, qualities: cached.qualities || [], subtitles: cached.subtitles || [] };
+    return { videoUrl: cached.url, referer: cached.referer, qualities: cached.qualities || [], subtitles: cached.subtitles || [], skips: cached.skips || [] };
   }
 
   const page = await browser.newPage();
@@ -183,9 +192,9 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
         // The proxy itself needs no headers; keep the historical Referer so
         // clients that always send one behave exactly as before.
         const referer = `${MIRURO_HOST}/`;
-        const result = { url: m3u8, referer, qualities: [], subtitles, ts: Date.now() };
+        const result = { url: m3u8, referer, qualities: [], subtitles, skips: c.skips, ts: Date.now() };
         streamCache.set(key, result);
-        return { videoUrl: m3u8, referer, qualities: [], subtitles };
+        return { videoUrl: m3u8, referer, qualities: [], subtitles, skips: c.skips };
       }
     }
     console.log('[MIRURO] no candidate stream served a playlist');

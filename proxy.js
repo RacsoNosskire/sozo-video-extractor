@@ -73,7 +73,16 @@ function rewritePlaylist(text, playlistUrl, referer, base) {
 }
 
 function mount(app) {
-    const base = (req) => `${req.protocol}://${req.get('host')}/proxy`;
+    // Links in rewritten playlists point back here. Behind a reverse proxy (the hosted browser
+    // app serves the extractor under /x over HTTPS) honour its X-Forwarded-* headers, so the
+    // links keep the page's scheme, host and path prefix.
+    const base = (req) => {
+        const first = (h) => (req.get(h) || '').split(',')[0].trim();
+        const proto = first('x-forwarded-proto') || req.protocol;
+        const host = first('x-forwarded-host') || req.get('host');
+        const prefix = first('x-forwarded-prefix').replace(/\/+$/, '');
+        return `${proto}://${host}${prefix}/proxy`;
+    };
     const params = (req) => ({ url: dec(req.query.u), referer: dec(req.query.r) });
     const fail = (res, path, e) => {
         console.error(`[PROXY ${path}] ${e.message}`);

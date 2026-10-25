@@ -25,6 +25,7 @@ COPY package.json ./
 RUN npm install --production
 COPY server.js ./
 COPY miruro.js ./
+COPY proxy.js ./
 
 EXPOSE 3232
 

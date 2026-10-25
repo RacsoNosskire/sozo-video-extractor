@@ -65,6 +65,14 @@ async function paheApiCall(path) {
 const app = express();
 const PORT = process.env.PORT || 3232;
 
+// The AniZiQ browser build (desktop-rs, trunk serve) calls this server from a web page.
+app.use((req, res, next) => {
+    res.set('Access-Control-Allow-Origin', '*');
+    res.set('Access-Control-Allow-Headers', 'Content-Type, Range');
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+});
+
 const cache = new Map();
 const CACHE_TTL = 30 * 60 * 1000;
 
@@ -746,6 +754,9 @@ app.get('/miruro/stream', async (req, res) => {
         if (!res.headersSent) res.status(500).json({ status: 'error', error: e.message });
     }
 });
+
+// HLS proxy for the browser build (Referer, CORS, fake-header stripping).
+require('./proxy').mount(app);
 
 app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime() });

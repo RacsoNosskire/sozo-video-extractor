@@ -1,5 +1,6 @@
 const express = require('express');
 const https = require('https');
+const { allowedOrigin } = require('./proxy');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -65,37 +66,23 @@ async function paheApiCall(path) {
 const app = express();
 const PORT = process.env.PORT || 3232;
 
-// The AniZiQ browser build (desktop-rs, trunk serve) calls this server from a web page.
+// The AniZiQ browser build (desktop-rs, trunk serve) calls this server from a web page. Other
+// sites get no CORS headers, so they can't read an answer.
 app.use((req, res, next) => {
-    res.set('Access-Control-Allow-Origin', '*');
-    res.set('Access-Control-Allow-Headers', 'Content-Type, Range');
+    const origin = allowedOrigin(req.get('origin'));
+    res.vary('Origin');
+    if (origin) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Access-Control-Allow-Headers', 'Content-Type, Range');
+    }
     if (req.method === 'OPTIONS') return res.sendStatus(204);
     next();
 });
 
-const cache = new Map();
-const CACHE_TTL = 30 * 60 * 1000;
-
-function getCached(key) {
-    const entry = cache.get(key);
-    if (entry && Date.now() - entry.time < CACHE_TTL) return entry.value;
-    cache.delete(key);
-    return null;
-}
-
-function setCache(key, value) {
-    cache.set(key, { value, time: Date.now() });
-}
-
-setInterval(() => {
-    const now = Date.now();
-    for (const [key, entry] of cache) {
-        if (now - entry.time > CACHE_TTL) cache.delete(key);
-    }
-}, 10 * 60 * 1000);
-
 let browser = null;
 
+// --no-sandbox stays: Chrome's sandbox needs user namespaces, which Docker's default seccomp
+// profile refuses even to a non-root user. --no-zygote goes with it.
 async function getBrowser() {
     if (!browser || !browser.connected) {
         browser = await puppeteer.launch({
@@ -105,7 +92,6 @@ async function getBrowser() {
                 '--disable-setuid-sandbox',
                 '--disable-dev-shm-usage',
                 '--disable-gpu',
-                '--disable-web-security',
                 '--disable-features=IsolateOrigins,site-per-process',
                 '--no-first-run',
                 '--no-zygote',
@@ -116,203 +102,8 @@ async function getBrowser() {
     return browser;
 }
 
-async function extractVideoUrl(watchUrl) {
-    const cached = getCached(watchUrl);
-    if (cached) {
-        console.log(`[CACHE HIT] ${watchUrl}`);
-        return cached;
-    }
-
-    console.log(`[EXTRACT] ${watchUrl}`);
-    const br = await getBrowser();
-    const page = await br.newPage();
-
-    try {
-        await page.setUserAgent(
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-        );
-
-        let videoUrl = '';
-        let megaupEmbedUrl = '';
-        let subtitles = [];
-        const allUrls = [];
-
-        const client = await page.target().createCDPSession();
-        await client.send('Network.enable');
-
-        client.on('Network.requestWillBeSent', (params) => {
-            const url = params.request.url;
-            allUrls.push(url);
-
-            // Capture megaup embed URL from network
-            if (!megaupEmbedUrl && url.includes('megaup.nl/e/')) {
-                console.log(`[MEGAUP URL] ${url}`);
-                megaupEmbedUrl = url;
-            }
-
-            if (!videoUrl) {
-                if (url.includes('.m3u8')) {
-                    console.log(`[HLS] ${url}`);
-                    videoUrl = url;
-                } else if (url.match(/\.mp4(\?|$)/) && !url.includes('thumb') && !url.includes('poster')) {
-                    console.log(`[MP4] ${url}`);
-                    videoUrl = url;
-                }
-            }
-        });
-
-        // Also capture response bodies for endpoints that may contain video URLs
-        client.on('Network.responseReceived', async (params) => {
-            const url = params.response.url;
-            if (url.includes('.vtt') && !url.includes('thumbnail')) {
-                subtitles.push(url);
-            }
-        });
-
-        await page.goto(watchUrl, { waitUntil: 'domcontentloaded', timeout: 25000 });
-
-        // Wait for the SPA to load and auto-play the video
-        await new Promise(r => setTimeout(r, 5000));
-
-        // Try to click the first server if not already clicked
-        try {
-            await page.evaluate(() => {
-                const server = document.querySelector('#servers a.active') || document.querySelector('#servers a');
-                if (server) server.click();
-            });
-            console.log('[CLICK] Clicked first server');
-        } catch (e) {}
-
-        // Wait for megaup iframe and navigate to it directly to force load
-        await new Promise(r => setTimeout(r, 5000));
-
-        // Use megaup URL captured from network requests
-        try {
-            const megaupUrl = megaupEmbedUrl;
-            if (megaupUrl) {
-                console.log(`[MEGAUP] Loading: ${megaupUrl}`);
-                // Visit the megaup page directly in a new tab to bypass iframe restrictions
-                const megaupPage = await br.newPage();
-                await megaupPage.setUserAgent(
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36'
-                );
-                await megaupPage.setExtraHTTPHeaders({
-                    'Referer': watchUrl.replace(/#.*$/, ''),
-                });
-
-                // Capture network on this page too
-                const megaClient = await megaupPage.target().createCDPSession();
-                await megaClient.send('Network.enable');
-                megaClient.on('Network.requestWillBeSent', (params) => {
-                    const url = params.request.url;
-                    if (!videoUrl) {
-                        if (url.includes('.m3u8')) { console.log(`[MEGA HLS] ${url}`); videoUrl = url; }
-                        else if (url.match(/\.mp4(\?|$)/) && !url.includes('thumb')) { console.log(`[MEGA MP4] ${url}`); videoUrl = url; }
-                    }
-                    allUrls.push(url);
-                });
-
-                await megaupPage.goto(megaupUrl, { waitUntil: 'domcontentloaded', timeout: 20000 }).catch(() => {});
-                await new Promise(r => setTimeout(r, 8000));
-
-                // Try to extract from JWPlayer
-                if (!videoUrl) {
-                    const src = await megaupPage.evaluate(() => {
-                        if (typeof jwplayer !== 'undefined') {
-                            try {
-                                const p = jwplayer();
-                                if (p && p.getPlaylistItem) {
-                                    const item = p.getPlaylistItem();
-                                    if (item && item.file) return item.file;
-                                    if (item && item.sources && item.sources[0]) return item.sources[0].file;
-                                }
-                            } catch (e) {}
-                        }
-                        const v = document.querySelector('video');
-                        if (v) return v.src || v.currentSrc || '';
-                        return '';
-                    }).catch(() => '');
-                    if (src) { console.log(`[MEGA JW] ${src}`); videoUrl = src; }
-                }
-                await megaupPage.close().catch(() => {});
-            }
-        } catch (e) {
-            console.log(`[MEGAUP ERR] ${e.message}`);
-        }
-
-        // If still no video URL, try to extract from JWPlayer or video element in any frame
-        if (!videoUrl) {
-            console.log('[POLL] Checking frames for video...');
-            for (const frame of page.frames()) {
-                try {
-                    const src = await frame.evaluate(() => {
-                        // Try JWPlayer
-                        if (typeof jwplayer !== 'undefined') {
-                            try {
-                                const p = jwplayer();
-                                if (p && p.getPlaylistItem) {
-                                    const item = p.getPlaylistItem();
-                                    if (item && item.file) return item.file;
-                                    if (item && item.sources && item.sources[0]) {
-                                        return item.sources[0].file || item.sources[0].src;
-                                    }
-                                }
-                                if (p && p.getPlaylist) {
-                                    const pl = p.getPlaylist();
-                                    if (pl && pl[0] && pl[0].file) return pl[0].file;
-                                }
-                            } catch (e) {}
-                        }
-                        // Try video element
-                        const video = document.querySelector('video');
-                        if (video) {
-                            if (video.src && video.src.startsWith('http')) return video.src;
-                            if (video.currentSrc && video.currentSrc.startsWith('http')) return video.currentSrc;
-                            const source = video.querySelector('source[src]');
-                            if (source && source.src) return source.src;
-                        }
-                        return '';
-                    }).catch(() => '');
-
-                    if (src) {
-                        console.log(`[FRAME] Found video in ${frame.url()}: ${src}`);
-                        videoUrl = src;
-                        break;
-                    }
-                } catch (e) {}
-            }
-        }
-
-        // If still nothing, wait more
-        if (!videoUrl) {
-            console.log('[WAIT] More waiting...');
-            await new Promise(r => setTimeout(r, 8000));
-        }
-
-        if (videoUrl) {
-            const result = { videoUrl, subtitles };
-            setCache(watchUrl, result);
-            console.log(`[SUCCESS] ${videoUrl}`);
-            return result;
-        }
-
-        // Debug: log unique non-static URLs
-        console.log('[DEBUG] All non-static URLs seen:');
-        const filtered = allUrls.filter(u =>
-            !u.includes('.css') && !u.includes('.js') && !u.includes('.png') &&
-            !u.includes('.jpg') && !u.includes('.svg') && !u.includes('.woff') &&
-            !u.includes('.gif') && !u.includes('.ico') && !u.includes('cloudflare') &&
-            !u.includes('google') && !u.includes('sharethis') && !u.includes('gravatar')
-        );
-        filtered.slice(-30).forEach(u => console.log('  ' + u));
-
-        console.log('[FAIL] No video URL found');
-        return null;
-
-    } finally {
-        await page.close().catch(() => {});
-    }
-}
+// Sessions go into animepahe.pw URLs; nothing but an id belongs there.
+const paheId = (s) => typeof s === 'string' && /^[A-Za-z0-9-]{1,128}$/.test(s);
 
 // Search animepahe (uses cached cookies, no Puppeteer per request)
 app.get('/animepahe/search', async (req, res) => {
@@ -335,7 +126,7 @@ app.get('/animepahe/search', async (req, res) => {
 app.get('/animepahe/episodes', async (req, res) => {
     const session = req.query.session;
     const page = parseInt(req.query.page, 10) || 1;
-    if (!session) return res.status(400).json({ error: 'Missing session parameter' });
+    if (!paheId(session)) return res.status(400).json({ error: 'Missing session parameter' });
     try {
         console.log(`[PAHE] Episodes: ${session} page=${page}`);
         const body = await paheApiCall(`/api?m=release&id=${session}&sort=episode_asc&page=${page}`);
@@ -353,7 +144,7 @@ app.get('/animepahe/episodes', async (req, res) => {
 app.get('/animepahe/video', async (req, res) => {
     const session = req.query.session;
     const epSession = req.query.ep;
-    if (!session || !epSession) return res.status(400).json({ error: 'Missing session/ep' });
+    if (!paheId(session) || !paheId(epSession)) return res.status(400).json({ error: 'Missing session/ep' });
     // Hard timeout so we never leave the client hanging if puppeteer wedges.
     const overallTimeout = setTimeout(() => {
         if (!res.headersSent) {
@@ -555,170 +346,7 @@ app.get('/animepahe/video', async (req, res) => {
     }
 });
 
-// ── AniList TV Pairing ──────────────────────────────────────────────
-// In-memory store: code → { token, createdAt }
-const pairSessions = new Map();
-const PAIR_TTL = 5 * 60 * 1000; // 5 min
-const ANILIST_CLIENT_ID = '38692';
-
-// Cleanup expired sessions every minute
-setInterval(() => {
-    const now = Date.now();
-    for (const [code, s] of pairSessions) {
-        if (now - s.createdAt > PAIR_TTL) pairSessions.delete(code);
-    }
-}, 60_000);
-
-function generateCode() {
-    const chars = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'; // no 0/O/1/I
-    let code = '';
-    for (let i = 0; i < 6; i++) code += chars[Math.floor(Math.random() * chars.length)];
-    return code;
-}
-
-// TV calls this to create a pairing session → returns { code }
-app.get('/auth/pair', (req, res) => {
-    let code;
-    do { code = generateCode(); } while (pairSessions.has(code));
-    pairSessions.set(code, { token: null, createdAt: Date.now() });
-    console.log(`[PAIR] Created session ${code}`);
-    res.json({ code });
-});
-
-// Phone opens this URL (from QR) → shows a page that handles the full OAuth flow client-side
-app.get('/auth/login', (req, res) => {
-    const code = req.query.code;
-    if (!code || !pairSessions.has(code)) {
-        return res.status(400).send('Invalid or expired pairing code.');
-    }
-    const serverOrigin = `${req.protocol || 'http'}://${req.headers.host}`;
-    res.setHeader('Content-Type', 'text/html');
-    res.send(`<!DOCTYPE html>
-<html><head><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Sozo TV Login</title>
-<style>
-  body { font-family: -apple-system, sans-serif; background: #141414; color: #e5e5e5;
-         display: flex; justify-content: center; align-items: center; min-height: 100vh; margin: 0; padding: 20px; box-sizing: border-box; }
-  .box { text-align: center; max-width: 420px; width: 100%; }
-  h2 { color: #E50914; margin-bottom: 8px; }
-  p { line-height: 1.5; }
-  .ok { color: #4caf50; }
-  .err { color: #E50914; }
-  .btn { display: inline-block; background: #E50914; color: white; padding: 14px 32px; border-radius: 4px;
-         font-size: 18px; font-weight: bold; text-decoration: none; margin-top: 16px; }
-  .btn:hover { background: #c40812; }
-  #token-section { display: none; margin-top: 20px; }
-  textarea { width: 100%; height: 60px; background: #2a2a2a; border: 1px solid #555; color: white;
-             border-radius: 4px; padding: 10px; font-size: 14px; resize: vertical; margin-top: 8px; }
-  .submit-btn { background: #E50914; color: white; padding: 10px 24px; border: none; border-radius: 4px;
-                font-size: 16px; cursor: pointer; margin-top: 8px; }
-</style></head><body>
-<div class="box">
-  <div id="step1">
-    <h2>Sozo TV Login</h2>
-    <p>Pairing code: <strong style="color:#E50914;font-size:1.4em;letter-spacing:3px">${code}</strong></p>
-    <a class="btn" href="https://anilist.co/api/v2/oauth/authorize?client_id=${ANILIST_CLIENT_ID}&response_type=token">Login with AniList</a>
-    <p style="color:#808080;font-size:13px;margin-top:20px">After login, AniList shows your token on a page.<br>Copy it and paste below.</p>
-  </div>
-  <div id="token-section">
-    <h2>Paste your token</h2>
-    <p style="color:#808080;font-size:14px">After authorizing, AniList shows a page with your token. Copy the entire token and paste it here:</p>
-    <textarea id="token-input" placeholder="Paste access token here..."></textarea>
-    <br><button class="submit-btn" onclick="sendToken()">Send to TV</button>
-    <p id="result"></p>
-  </div>
-  <div id="done" style="display:none">
-    <h2 class="ok">Connected!</h2>
-    <p>You can close this page and return to your TV.</p>
-  </div>
-</div>
-<script>
-// Show token input after clicking the AniList link
-document.querySelector('.btn').addEventListener('click', function() {
-  setTimeout(function() { document.getElementById('token-section').style.display = 'block'; }, 1000);
-});
-// Also check if we came back with a hash fragment (some flows)
-if (window.location.hash.includes('access_token')) {
-  var hash = window.location.hash.substring(1);
-  var params = {};
-  hash.split('&').forEach(function(p) { var kv = p.split('='); if(kv.length===2) params[kv[0]]=kv[1]; });
-  if (params['access_token']) {
-    document.getElementById('token-input').value = params['access_token'];
-    document.getElementById('token-section').style.display = 'block';
-    sendToken();
-  }
-}
-function sendToken() {
-  var raw = document.getElementById('token-input').value.trim();
-  var token = raw;
-  if (raw.includes('access_token=')) { token = raw.split('access_token=')[1].split('&')[0]; }
-  if (!token || token.length < 20) {
-    document.getElementById('result').innerHTML = '<span class="err">Token looks too short. Make sure you copied the full token.</span>';
-    return;
-  }
-  document.getElementById('result').innerHTML = 'Sending...';
-  fetch('${serverOrigin}/auth/complete', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code: '${code}', token: token })
-  }).then(function(r) { return r.json(); }).then(function(d) {
-    if (d.ok) {
-      document.getElementById('token-section').style.display = 'none';
-      document.getElementById('step1').style.display = 'none';
-      document.getElementById('done').style.display = 'block';
-    } else {
-      document.getElementById('result').innerHTML = '<span class="err">' + (d.error||'Failed') + '</span>';
-    }
-  }).catch(function(e) {
-    document.getElementById('result').innerHTML = '<span class="err">' + e.message + '</span>';
-  });
-}
-</script></body></html>`);
-});
-
-// Phone's callback page POSTs the token here
-app.post('/auth/complete', express.json(), (req, res) => {
-    const { code, token } = req.body || {};
-    if (!code || !token) return res.json({ ok: false, error: 'Missing code or token' });
-    const session = pairSessions.get(code);
-    if (!session) return res.json({ ok: false, error: 'Invalid or expired code' });
-    session.token = token;
-    console.log(`[PAIR] Token received for ${code} (${token.length} chars)`);
-    res.json({ ok: true });
-});
-
-// TV polls this until token arrives
-app.get('/auth/poll', (req, res) => {
-    const code = req.query.code;
-    if (!code) return res.json({ status: 'error', error: 'Missing code' });
-    const session = pairSessions.get(code);
-    if (!session) return res.json({ status: 'expired' });
-    if (session.token) {
-        const token = session.token;
-        pairSessions.delete(code); // one-time use
-        return res.json({ status: 'ok', token });
-    }
-    res.json({ status: 'waiting' });
-});
-
-// ── End pairing ─────────────────────────────────────────────────────
-
-app.get('/extract', async (req, res) => {
-    const url = req.query.url;
-    if (!url) return res.status(400).json({ error: 'Missing url parameter' });
-
-    try {
-        const result = await extractVideoUrl(url);
-        if (result) {
-            res.json({ status: 'ok', videoUrl: result.videoUrl, subtitles: result.subtitles });
-        } else {
-            res.status(404).json({ status: 'error', error: 'No video URL found' });
-        }
-    } catch (e) {
-        console.error(`[ERROR] ${e.message}`);
-        res.status(500).json({ status: 'error', error: e.message });
-    }
-});
+require('./pairing').mount(app);
 
 // ── Miruro (AniList-native, browser-driven) ─────────────────────────
 const { resolveMiruroStream } = require('./miruro');

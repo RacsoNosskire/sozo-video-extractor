@@ -1,4 +1,4 @@
-FROM node:20-slim
+FROM node:22-slim
 
 # Use Google Chrome Stable rather than Debian's chromium package: the latter
 # (currently v150) SIGTRAPs on launch inside a container. Chrome Stable is the
@@ -16,17 +16,24 @@ RUN apt-get update \
         fonts-wqy-zenhei \
     && rm -rf /var/lib/apt/lists/*
 
+# Chrome and the server run as this user. Chrome writes its profile and crash data under HOME.
+RUN useradd --create-home --shell /usr/sbin/nologin extractor
+
 # Use the system Chrome (don't let Puppeteer download its own).
+ENV PUPPETEER_SKIP_DOWNLOAD=true
 ENV PUPPETEER_SKIP_CHROMIUM_DOWNLOAD=true
 ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/google-chrome-stable
 
 WORKDIR /app
-COPY package.json ./
-RUN npm install --production
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev
 COPY server.js ./
 COPY miruro.js ./
 COPY proxy.js ./
+COPY pairing.js ./
 
 EXPOSE 3232
+
+USER extractor
 
 CMD ["node", "server.js"]

@@ -41,6 +41,60 @@ function tsStart(d) {
     return 0;
 }
 
+// WebVTT cleaned as desktop-rs/src/proxy.rs `clean_vtt` does: text split off a cue by a blank line
+// is joined back onto it, and cues that are only an ASS vector drawing ("m 0 0 l 250 0 ...") go.
+// Anything that isn't WebVTT comes back unchanged.
+const vttTime = (s) => {
+    const dot = s.indexOf('.');
+    if (dot < 0) return false;
+    const clock = s.slice(0, dot).split(':');
+    return clock.length >= 2 && clock.length <= 3
+        && [...clock, s.slice(dot + 1)].every((p) => /^[0-9]+$/.test(p));
+};
+
+function vttCueText(block) {
+    const at = block[0].includes('-->') ? 0 : 1;
+    const line = block[at];
+    if (line === undefined || !line.includes('-->')) return null;
+    const [start, rest] = line.split(/-->(.*)/s);
+    const end = rest.trim().split(/\s+/)[0];
+    return vttTime(start.trim()) && vttTime(end) ? block.slice(at + 1) : null;
+}
+
+function isVttDrawing(text) {
+    const tokens = text.join(' ').replace(/<[^>]*>/g, '').trim().split(/\s+/);
+    return tokens[0] === 'm' && tokens.length >= 3
+        && tokens.slice(1).every((t) => ['m', 'n', 'l', 'b', 's', 'p', 'c'].includes(t) || Number.isFinite(Number(t)));
+}
+
+function cleanVtt(text) {
+    if (!text.replace(/^\uFEFF/, '').startsWith('WEBVTT')) return text;
+    const blocks = [];
+    let block = [];
+    for (const line of text.split(/\r?\n/)) {
+        if (line.trim()) block.push(line);
+        else if (block.length) { blocks.push(block); block = []; }
+    }
+    if (block.length) blocks.push(block);
+    const out = [];
+    let lastIsCue = false;
+    blocks.forEach((b, i) => {
+        if (i === 0 || /^(NOTE|STYLE|REGION)/.test(b[0])) {
+            lastIsCue = false;
+            out.push(b);
+            return;
+        }
+        const cue = vttCueText(b);
+        if (cue) {
+            lastIsCue = !isVttDrawing(cue);
+            if (lastIsCue) out.push(b);
+        } else if (lastIsCue && out.length) {
+            out[out.length - 1].push(...b);
+        }
+    });
+    return out.map((b) => b.join('\n')).join('\n\n') + '\n';
+}
+
 function rewritePlaylist(text, playlistUrl, referer, base) {
     const proxied = (uri, playlist) => {
         const abs = new URL(uri, playlistUrl).toString();
@@ -113,9 +167,9 @@ function mount(app) {
         try {
             const { url, referer } = params(req);
             const { body } = await fetchRetry(url, referer);
-            res.type('text/vtt; charset=utf-8').send(body);
+            res.type('text/vtt; charset=utf-8').send(cleanVtt(body.toString('utf8')));
         } catch (e) { fail(res, 'sub', e); }
     });
 }
 
-module.exports = { mount, rewritePlaylist, tsStart };
+module.exports = { mount, rewritePlaylist, tsStart, cleanVtt };

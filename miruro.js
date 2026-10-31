@@ -187,7 +187,7 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
         const subtitles = c.subtitles
           .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
           .sort((a, b) => (b.default === true) - (a.default === true))
-          .map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English' }));
+          .map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
 
         // The proxy itself needs no headers; keep the historical Referer so
         // clients that always send one behave exactly as before.

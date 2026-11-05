@@ -104,6 +104,13 @@ test('refusals look like AniList, and offline edits drop the connection', async 
     await assert.rejects(gql(base, 'fake-mia-offline-00001', SAVE, { id: 1, status: 'CURRENT' }));
 });
 
+test('GraphQL at / and /graphql only: elsewhere is a 404, like a server without /sync', async (t) => {
+    const base = await serve(t, {});
+    assert.equal((await gql(`${base}graphql`, 'fake-tester-pc-0000001', 'query { Viewer { id } }')).body.data.Viewer.id, 1001);
+    const sync = await fetch(`${base}sync`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{"v":1}' });
+    assert.equal(sync.status, 404);
+});
+
 test("the extractor's /sync sign-in check works against the fake", async (t) => {
     const base = await serve(t, {});
     const lookup = require('../sync').viewerLookup({ url: base });

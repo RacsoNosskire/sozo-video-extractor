@@ -240,6 +240,14 @@ function start({ port = DEFAULT_PORT, host = '127.0.0.1', lists = {}, recs = nul
     const server = http.createServer((req, res) => {
         cors(req, res);
         if (req.method === 'OPTIONS') { res.statusCode = 204; return res.end(); }
+        // GraphQL lives at / as on AniList; any other path is a 404, so this also stands in for a
+        // server without /sync.
+        const route = (req.url || '/').split('?')[0];
+        if (route !== '/' && route !== '/graphql') {
+            res.statusCode = 404;
+            res.setHeader('Content-Type', 'application/json');
+            return res.end(JSON.stringify({ errors: [{ message: 'Not Found', status: 404 }], data: null }));
+        }
         if (req.method === 'GET') {
             res.setHeader('Content-Type', 'text/plain; charset=utf-8');
             return res.end(HELP);

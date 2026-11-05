@@ -220,6 +220,9 @@ node dev/fake-anilist.js [--port 3299] [--lists [<name>=]<file>]... [--recs <fil
   AniList (or to `AZ_FAKE_RECS`), so this is for direct checks.
 - Shows saved through it take their title and cover from the fixture files when they're in them,
   else "Anime <id>".
+- GraphQL is answered at `/` (and `/graphql`); any other path is a 404. So
+  `AZ_SYNC_URL=http://127.0.0.1:3299` makes a server without `/sync` for the apps' "doesn't sync yet"
+  check.
 - CORS for the dev web build (`http://localhost:8791`, `http://127.0.0.1:8791`).
 - One log line per request, with the viewer and never the token: `[FAKE ANILIST] Tester 1001: saved 154587 as PLANNING`.
 

@@ -479,6 +479,42 @@ test('/sync: an unreadable account file is set aside and started again', async (
     assert.equal(readDoc(dir, 1001).rev, 1);
 });
 
+test('/sync: an account file is flushed before it is renamed into place, and the folder after', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url });
+    const events = [];
+    const name = (p) => (path.resolve(p) === path.resolve(dir) ? 'folder' : p.endsWith('.tmp') ? 'tmp' : path.basename(p));
+    const { open, rename } = fs.promises;
+    t.mock.method(fs.promises, 'open', async (p, ...rest) => {
+        const fh = await open(p, ...rest);
+        const flush = fh.sync.bind(fh);
+        fh.sync = () => flush().then(() => events.push(`sync ${name(p)}`), (e) => {
+            events.push(`sync ${name(p)} ${e.code}`);
+            throw e;
+        });
+        return fh;
+    });
+    t.mock.method(fs.promises, 'rename', async (from, to) => {
+        await rename(from, to);
+        events.push(`rename ${name(from)} ${name(to)}`);
+    });
+    assert.equal((await call(base, TOK_A, ask(1001, '', 0, { history: [watch(21, 1)] }))).status, 200);
+    // Windows can't flush a folder (EPERM), which is all right.
+    assert.deepEqual(events.map((e) => e.replace(/ EPERM$/, '')), ['sync tmp', 'rename tmp 1001.json', 'sync folder']);
+    assert.deepEqual(fs.readdirSync(dir), ['1001.json']);
+});
+
+test('/sync: temporary files of writes that never finished are removed at start', (t) => {
+    const dir = tempDir(t);
+    const keep = ['1001.json', '1001.json.bad-1793906454024', 'notes.tmp'];
+    for (const n of [...keep, '1001.json.1.dead.tmp', '2002.json.77.0a1b2c3d.tmp']) fs.writeFileSync(path.join(dir, n), '{"v":1,');
+    const log = t.mock.method(console, 'log', () => {});
+    sync.mount(express(), { dir });
+    assert.deepEqual(fs.readdirSync(dir).sort(), keep.sort());
+    assert.ok(log.mock.calls.some((c) => c.arguments[0] === '[SYNC] removed 2 temporary file(s) left by writes that never finished'));
+});
+
 test('/sync: parallel pushes for one account all land', async (t) => {
     const anilist = await standIn(t);
     const dir = tempDir(t);

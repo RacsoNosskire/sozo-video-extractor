@@ -101,8 +101,9 @@ These two are the shared wire fixture: `sync.test.js` holds them in full (`REQUE
   refused by the checks below; they never fail the request. `now` is this server's clock (ms), for a
   device to tell how far off its own is; apps that don't know it ignore it.
 - An `epoch` that isn't the server's is answered as `since = 0`. A `since` past the file's `rev`
-  (a file restored from something older) makes a new epoch first. Either way the devices see a new
-  epoch and send their entries again, so a lost server copy fills itself.
+  (a file restored from something older) makes a new epoch first, though not always for a file put
+  back by hand (see Storage). Either way the devices see a new epoch and send their entries again,
+  so a lost server copy fills itself.
 - Checks: unknown fields go; `title` and `subtitle` are cut to 300 characters, and history and saved
   need a title; `imageUrl` stays only when it starts with `https://s4.anilist.co/` (AniList's CDN,
   every device fetches it) and is at most 1000 characters, else it is stored as `""`; `episode` and
@@ -140,9 +141,14 @@ refused without asking it.
 
 Storage: one file per account, `SYNC_DIR/<id>.json` (`{"v":1,"user":…,"epoch":…,"rev":…,"updatedAt":…,
 "history":{"21":{"at":…,"rev":…,"data":{…}}},"saved":{…},"hidden":{…}}`). Requests for one account run
-one at a time, read the file fresh, and write it whole to a temporary file that is then renamed over
-it, so a 200 means the data is on disk. A file that doesn't read is kept as `<id>.json.bad-<ms>` and
-a new copy starts (the devices fill it again). Each request logs one line, never the token:
+one at a time, read the file fresh, and write it whole to a temporary file, which is flushed to disk
+and then renamed over it, and the folder is flushed after (Windows can't flush a folder), so a 200
+means the data is on disk, a power cut included. The temporary file of a write that never finished
+is removed at start. A file that doesn't read is kept as `<id>.json.bad-<ms>` and a new copy starts
+(the devices fill it again). An account file put back by hand (from a backup) needs a new `epoch`
+too (any other 16 hex digits), or delete it instead: the server notices an older copy by a device's
+cursor being past its `rev`, but only until other devices have written to it, and after that
+entries go missing without a sign. Each request logs one line, never the token:
 `[SYNC] 1001: 3 in, 3 out[, 1 skipped]` ("in" = entries that changed the copy).
 
 ## Deploying

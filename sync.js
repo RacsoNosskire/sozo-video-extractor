@@ -38,6 +38,7 @@ const MAX_EPISODE = 100_000;
 const IMAGES = 'https://s4.anilist.co/';
 const BEARER = /^Bearer ([A-Za-z0-9._~+/=-]{20,4096})$/;
 const ACCOUNT_FILE = /^\d+\.json$/;
+const TEMP_FILE = /^\d+\.json\..+\.tmp$/; // see save()
 
 class HttpError extends Error {
     constructor(status, message) {
@@ -332,6 +333,32 @@ function validDoc(doc, user) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// A rename is on disk once its folder is. Windows can't flush a folder (EPERM), nor can some file
+// systems (EINVAL); the file itself is flushed before the rename either way.
+async function syncDir(dir) {
+    let d = null;
+    try {
+        d = await fs.promises.open(dir, 'r');
+        await d.sync();
+    } catch (e) {
+        if (!['EPERM', 'EISDIR', 'EINVAL'].includes(e.code)) throw e;
+    } finally {
+        await d?.close();
+    }
+}
+
+// The temporary files of writes that never finished (the process died before the rename). Only at
+// start, while no write is under way.
+function removeUnfinished(dir) {
+    try {
+        const names = fs.readdirSync(dir).filter((n) => TEMP_FILE.test(n));
+        for (const name of names) fs.unlinkSync(path.join(dir, name));
+        if (names.length) console.log(`[SYNC] removed ${names.length} temporary file(s) left by writes that never finished`);
+    } catch (e) {
+        console.error(`[SYNC] old temporary files in ${dir} can't be removed (${e.code || e.message})`);
+    }
+}
+
 // Mounts POST /sync. Options (tests; the environment otherwise): dir (SYNC_DIR), anilistUrl
 // (ANILIST_URL), allow (SYNC_USERS), maxUsers (SYNC_MAX_USERS), trusted (TRUSTED_PROXIES), now,
 // fetchImpl. Returns { ready, dir }; ready is false when the folder can't be written, and /sync
@@ -352,7 +379,10 @@ function mount(app, opts = {}) {
     } catch (e) {
         console.error(`[SYNC] ${dir} can't be used (${e.code || e.message}), so /sync is off`);
     }
-    if (ready) console.log(`[SYNC] accounts in ${dir}: ${allow ? `only ${[...allow].join(', ')}` : `any AniList account, up to ${maxUsers}`}`);
+    if (ready) {
+        removeUnfinished(dir);
+        console.log(`[SYNC] accounts in ${dir}: ${allow ? `only ${[...allow].join(', ')}` : `any AniList account, up to ${maxUsers}`}`);
+    }
 
     const file = (user) => path.join(dir, `${user}.json`);
     const queues = new Map();
@@ -401,12 +431,19 @@ function mount(app, opts = {}) {
         return { doc: emptyDoc(user), fresh: true };
     }
 
-    // Written whole to a temporary file, then renamed over the old one.
+    // Written whole to a temporary file and flushed to disk, then renamed over the old one and the
+    // folder flushed, so what a 200 confirms survives a power cut too.
     async function save(user, doc) {
         const target = file(user);
         const tmp = `${target}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`;
         try {
-            await fs.promises.writeFile(tmp, JSON.stringify(doc));
+            const fh = await fs.promises.open(tmp, 'w');
+            try {
+                await fh.writeFile(JSON.stringify(doc));
+                await fh.sync();
+            } finally {
+                await fh.close();
+            }
             for (let attempt = 0; ; attempt++) {
                 try {
                     await fs.promises.rename(tmp, target);
@@ -417,6 +454,7 @@ function mount(app, opts = {}) {
                     await sleep(50 * (attempt + 1));
                 }
             }
+            await syncDir(dir);
         } catch (e) {
             await fs.promises.unlink(tmp).catch(() => {});
             console.error(`[SYNC] ${user}: write failed (${e.code || e.message})`);

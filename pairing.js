@@ -4,6 +4,7 @@
 // travels on screen, so it only lets a phone hand a token over: only the secret takes one out.
 
 const crypto = require('crypto');
+const net = require('net');
 const express = require('express');
 const { publicBase } = require('./proxy');
 
@@ -23,12 +24,50 @@ function sameSecret(a, b) {
     return crypto.timingSafeEqual(hash(a), hash(b));
 }
 
-// At most `limit` requests a minute from one client. Behind nginx every request comes from
-// nginx, which names the real client in X-Real-IP.
-function rateLimit(limit, windowMs = 60_000) {
+// The reverse proxies whose X-Real-IP is believed: the site's nginx, which names the visitor
+// there. TRUSTED_PROXIES is a comma-separated list of addresses or CIDR ranges; unset trusts none,
+// because anyone on the LAN can reach this server directly and write any X-Real-IP they like.
+function trustedProxies(spec = process.env.TRUSTED_PROXIES) {
+    if (spec instanceof net.BlockList) return spec;
+    const list = new net.BlockList();
+    const items = Array.isArray(spec) ? spec : String(spec || '').split(',');
+    for (const item of items.map((s) => String(s).trim()).filter(Boolean)) {
+        const [addr, bits, extra] = item.split('/');
+        const type = net.isIPv4(addr) ? 'ipv4' : net.isIPv6(addr) ? 'ipv6' : null;
+        const prefix = bits === undefined ? null : /^\d{1,3}$/.test(bits) ? Number(bits) : -1;
+        if (!type || extra !== undefined || prefix < 0 || prefix > (type === 'ipv4' ? 32 : 128)) {
+            console.error(`[TRUST] TRUSTED_PROXIES: "${item}" is not an address or range, ignored`);
+        } else if (prefix === null) {
+            list.addAddress(addr, type);
+        } else {
+            list.addSubnet(addr, prefix, type);
+        }
+    }
+    return list;
+}
+
+const unmapped = (ip) => (ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip);
+const ignoredProxies = new Set();
+
+// Who sent a request: the socket's peer, or the X-Real-IP a trusted proxy names.
+function clientAddress(req, trusted) {
+    const peer = unmapped(req.socket.remoteAddress || '');
+    const real = unmapped((req.get('x-real-ip') || '').trim());
+    if (!real || !net.isIP(peer)) return peer;
+    if (trusted.check(peer, net.isIPv4(peer) ? 'ipv4' : 'ipv6')) return net.isIP(real) ? real : peer;
+    if (ignoredProxies.size < 20 && !ignoredProxies.has(peer)) {
+        ignoredProxies.add(peer);
+        console.log(`[TRUST] X-Real-IP from ${peer} ignored (not in TRUSTED_PROXIES)`);
+    }
+    return peer;
+}
+
+// At most `limit` requests a minute from one client (see clientAddress).
+function rateLimit(limit, windowMs = 60_000, { trusted } = {}) {
     const hits = new Map();
+    const proxies = trustedProxies(trusted);
     return (req, res, next) => {
-        const client = req.get('x-real-ip') || req.socket.remoteAddress;
+        const client = clientAddress(req, proxies);
         const now = Date.now();
         if (hits.size > 10_000) hits.clear();
         let entry = hits.get(client);
@@ -130,7 +169,9 @@ function sendToken() {
 </script></body></html>`;
 }
 
-function mount(app) {
+// `trusted`: the proxies whose X-Real-IP counts (see trustedProxies).
+function mount(app, { trusted } = {}) {
+    const limit = (n) => rateLimit(n, 60_000, { trusted });
     // code → { secret, token, createdAt }
     const sessions = new Map();
     const live = (code) => {
@@ -145,7 +186,7 @@ function mount(app) {
     sweep.unref();
 
     // TV calls this to create a pairing session → returns { code, secret }
-    app.get('/auth/pair', rateLimit(10), (req, res) => {
+    app.get('/auth/pair', limit(10), (req, res) => {
         [...sessions.keys()].forEach(live);
         if (sessions.size >= MAX_SESSIONS) return res.status(429).json({ error: 'Too many pairing sessions' });
         let code;
@@ -157,7 +198,7 @@ function mount(app) {
     });
 
     // Phone opens this URL (from QR) → shows a page that handles the full OAuth flow client-side
-    app.get('/auth/login', rateLimit(30), (req, res) => {
+    app.get('/auth/login', limit(30), (req, res) => {
         const code = req.query.code;
         if (!live(code)) return res.status(400).send('Invalid or expired pairing code.');
         res.type('html').send(loginPage(code, publicBase(req)));
@@ -165,7 +206,7 @@ function mount(app) {
 
     // Phone's callback page POSTs the token here. A code takes one token: after that a guessed
     // code can't swap in another account's.
-    app.post('/auth/complete', rateLimit(20), express.json({ limit: '16kb' }), (req, res) => {
+    app.post('/auth/complete', limit(20), express.json({ limit: '16kb' }), (req, res) => {
         const { code, token } = req.body || {};
         if (!code || !token) return res.json({ ok: false, error: 'Missing code or token' });
         if (typeof token !== 'string' || token.length > MAX_TOKEN_LENGTH) return res.json({ ok: false, error: 'Bad token' });
@@ -177,7 +218,7 @@ function mount(app) {
     });
 
     // TV polls this until the token arrives. The secret comes in a header, out of access logs.
-    app.get('/auth/poll', rateLimit(120), (req, res) => {
+    app.get('/auth/poll', limit(120), (req, res) => {
         const code = req.query.code;
         if (!code) return res.json({ status: 'error', error: 'Missing code' });
         const session = live(code);
@@ -194,4 +235,4 @@ function mount(app) {
     });
 }
 
-module.exports = { mount, rateLimit, loginPage, generateCode, generateSecret };
+module.exports = { mount, rateLimit, trustedProxies, clientAddress, loginPage, generateCode, generateSecret };

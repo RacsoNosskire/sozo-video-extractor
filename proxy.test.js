@@ -136,17 +136,47 @@ test('codes and secrets are random and the right shape', () => {
     assert.match(pairing.generateSecret(), /^[0-9a-f]{64}$/);
 });
 
-test('the rate limit stops a client and not the next one', () => {
-    const limit = pairing.rateLimit(2);
+// A request as rateLimit sees it: the socket's peer and an optional X-Real-IP.
+const fromPeer = (peer, realIp) => ({ get: (h) => (h.toLowerCase() === 'x-real-ip' ? realIp : undefined), socket: { remoteAddress: peer } });
+
+function limiter(limit, trusted) {
+    const check = pairing.rateLimit(limit, 60_000, { trusted });
     const statuses = [];
-    const run = (ip) => {
+    const run = (req) => {
         let passed = false;
         const res = { status: (s) => { statuses.push(s); return res; }, json: () => {} };
-        limit({ get: () => ip, socket: {} }, res, () => { passed = true; });
+        check(req, res, () => { passed = true; });
         return passed;
     };
-    assert.deepEqual([run('a'), run('a'), run('a'), run('b')], [true, true, false, true]);
+    return { run, statuses };
+}
+
+test('the rate limit stops a client and not the next one', () => {
+    const { run, statuses } = limiter(2, '');
+    const a = fromPeer('192.168.40.20');
+    assert.deepEqual([run(a), run(a), run(a), run(fromPeer('192.168.40.21'))], [true, true, false, true]);
     assert.deepEqual(statuses, [429]);
+});
+
+test('X-Real-IP counts only from a trusted proxy', () => {
+    // From anyone else it is ignored, so a client can't get a fresh allowance by rotating it.
+    const direct = limiter(2, '');
+    assert.deepEqual([1, 2, 3].map((n) => direct.run(fromPeer('192.168.40.20', `10.9.9.${n}`))), [true, true, false]);
+
+    const behindNginx = limiter(2, '172.18.0.1, 10.0.0.0/8');
+    const viaNginx = (ip) => behindNginx.run(fromPeer('::ffff:172.18.0.1', ip));
+    assert.deepEqual([viaNginx('192.168.40.30'), viaNginx('192.168.40.30'), viaNginx('192.168.40.30'), viaNginx('192.168.40.31')], [true, true, false, true]);
+    assert.equal(behindNginx.run(fromPeer('10.1.2.3', '100.64.0.9')), true); // a trusted range
+    assert.deepEqual([behindNginx.run(fromPeer('10.1.2.3', 'junk')), behindNginx.run(fromPeer('10.1.2.3', 'junk'))], [true, true]);
+    assert.equal(behindNginx.run(fromPeer('10.1.2.3', 'junk')), false); // not an address: the proxy itself is the client
+
+    assert.equal(pairing.clientAddress(fromPeer('192.168.40.20', '1.2.3.4'), pairing.trustedProxies('')), '192.168.40.20');
+    assert.equal(pairing.clientAddress(fromPeer('::ffff:172.18.0.1', '1.2.3.4'), pairing.trustedProxies('172.18.0.1')), '1.2.3.4');
+    assert.equal(pairing.clientAddress(fromPeer('172.18.0.1'), pairing.trustedProxies('172.18.0.1')), '172.18.0.1');
+    const list = pairing.trustedProxies(['::1', '192.168.0.0/33', '192.168.0.0/', 'nonsense', '10.0.0.0/8/1']);
+    assert.equal(list.check('::1', 'ipv6'), true);
+    assert.equal(list.check('192.168.1.1', 'ipv4'), false);
+    assert.equal(list.check('8.8.8.8', 'ipv4'), false);
 });
 
 test('login page keeps hostile strings out of the script', () => {
@@ -183,8 +213,9 @@ test('pairing: QR flow end to end, and the secret guards the token', async (t) =
 });
 
 test('pairing: the session cap holds', async (t) => {
-    const base = await serve(t, pairing.mount);
-    const pair = (i) => fetch(`${base}/auth/pair`, { headers: { 'X-Real-IP': `c${Math.floor(i / 10)}` } });
+    // As if behind nginx (trusted here), so the per-client limit lets 100 sessions through.
+    const base = await serve(t, (app) => pairing.mount(app, { trusted: '127.0.0.1' }));
+    const pair = (i) => fetch(`${base}/auth/pair`, { headers: { 'X-Real-IP': `10.0.0.${Math.floor(i / 10)}` } });
     for (let i = 0; i < 100; i++) assert.equal((await pair(i)).status, 200);
     assert.equal((await pair(1000)).status, 429);
 });

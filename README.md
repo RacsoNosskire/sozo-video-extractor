@@ -51,14 +51,14 @@ version, so asking for it next costs nothing.
 ## `/health`
 
 ```
-{"status":"ok","uptime":3.15,"now":1793906454024,"lookups":{"lastOkAt":null,"lastFailAt":null,"lastError":null}}
+{"status":"ok","uptime":3.15,"now":1793906454024,"lookups":{"lastOkAt":null,"lastFailAt":null,"lastError":null},"sync":"ok"}
 ```
 
 `lookups` records the last episode lookup that worked (a 200 or a 404 counts: the source answered)
 and the last one that failed, as this server's `Date.now()` times, with `lastError` one of
 `source_down`, `timeout` or `error`. A lookup that finishes after its 504 is still recorded. Nothing
 else is kept: no show, no client. The apps compute ages against `now`, so clock differences don't
-matter.
+matter. `sync` is `ok` when `/sync` can store its files and `off` when `SYNC_DIR` can't be used.
 
 ## `/sync`
 
@@ -126,7 +126,8 @@ How a sign-in is checked: the header must be `Bearer ` plus 20–4096 characters
 kept by the token's SHA-256 for 10 minutes (a refusal for 1), concurrent checks of one token share a
 call, and at most 20 checks a minute that the cache can't answer go to AniList, for all clients
 together. The token itself is never stored, logged or written; a revoked token keeps working here
-for up to 10 minutes. Tokens starting `fake-` (the test tokens) are refused without asking AniList.
+for up to 10 minutes. While sign-ins go to AniList itself, tokens starting `fake-` (the test tokens)
+are refused without asking it.
 
 Storage: one file per account, `SYNC_DIR/<id>.json` (`{"v":1,"user":…,"epoch":…,"rev":…,"updatedAt":…,
 "history":{"21":{"at":…,"rev":…,"data":{…}}},"saved":{…},"hidden":{…}}`). Requests for one account run
@@ -178,7 +179,7 @@ yet. Ship the extractor before the apps.
 
 ## Local test helpers (`dev/`)
 
-Not copied into the image, and not matched by `node --test` (their tests are `*.test.js`).
+Not copied into the image. `npm test` runs their tests (`dev/*.test.js`), not the helpers.
 
 ### Fake AniList: `dev/fake-anilist.js`
 
@@ -256,6 +257,10 @@ an epoch and cursor 0, `node dev/device.js watch 21 5 600000 1420000 Test` write
 point at it with their extractor URL setting (`http://127.0.0.1:3232`, or `http://10.0.2.2:3232` from
 the emulator) and `AZ_ANILIST_URL=http://127.0.0.1:3299/` with a `fake-…` token. Chrome starts only
 when an episode is requested.
+
+On a PC with Node 26 a real episode lookup answers 500 ("require is not defined in ES module
+scope"): Puppeteer's `yargs` dependency has an extensionless CommonJS file that Node 26 reads as an
+ES module. Everything else runs; the image uses Node 22, where lookups work.
 
 ### Ports used by local checks
 

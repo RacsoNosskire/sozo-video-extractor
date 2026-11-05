@@ -104,6 +104,15 @@ test('refusals look like AniList, and offline edits drop the connection', async 
     await assert.rejects(gql(base, 'fake-mia-offline-00001', SAVE, { id: 1, status: 'CURRENT' }));
 });
 
+test("the extractor's /sync sign-in check works against the fake", async (t) => {
+    const base = await serve(t, {});
+    const lookup = require('../sync').viewerLookup({ url: base });
+    assert.equal(await lookup.idFor('fake-tester-pc-0000001'), 1001);
+    assert.equal(await lookup.idFor('fake-mia-offline-00001'), 900002);
+    await assert.rejects(lookup.idFor('fake-kid-expired-00001'), { status: 401 });
+    await assert.rejects(lookup.idFor('devtoken-pc-000000000000000001'), { status: 401 });
+});
+
 test('CORS answers the dev web build only', async (t) => {
     const base = await serve(t, {});
     const preflight = (origin) => fetch(base, {

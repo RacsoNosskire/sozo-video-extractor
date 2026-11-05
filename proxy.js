@@ -43,6 +43,21 @@ class Refused extends Error {
 // The origin to name in CORS headers, or null for anything else.
 const allowedOrigin = (origin) => (ALLOWED_ORIGINS.has(origin) ? origin : null);
 
+// CORS for the AniZiQ browser build: other sites get no headers, so they can't read an answer.
+// Authorization is for /sync, which the dev web build (localhost:8791) calls cross-origin; a
+// preflight is good for 10 minutes. Every preflight ends here.
+function cors(req, res, next) {
+    const origin = allowedOrigin(req.get('origin'));
+    res.vary('Origin');
+    if (origin) {
+        res.set('Access-Control-Allow-Origin', origin);
+        res.set('Access-Control-Allow-Headers', 'Content-Type, Range, Authorization');
+        res.set('Access-Control-Max-Age', '600');
+    }
+    if (req.method === 'OPTIONS') return res.sendStatus(204);
+    next();
+}
+
 // May this request use the proxy? A page's request must come from an allowed origin; one without
 // an Origin (a tag on someone's page) mustn't say it crossed sites. Plain-http servers don't get
 // Sec-Fetch-Site, so such a tag can still get through, but without CORS it can't read the answer.
@@ -342,5 +357,5 @@ function mount(app) {
 }
 
 module.exports = {
-    mount, rewritePlaylist, tsStart, cleanVtt, publicBase, allowedOrigin, browserAllowed, isBlockedIp, checkTarget, fetchRetry,
+    mount, cors, rewritePlaylist, tsStart, cleanVtt, publicBase, allowedOrigin, browserAllowed, isBlockedIp, checkTarget, fetchRetry,
 };

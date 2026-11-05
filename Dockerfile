@@ -31,6 +31,12 @@ COPY server.js ./
 COPY miruro.js ./
 COPY proxy.js ./
 COPY pairing.js ./
+COPY sync.js ./
+
+# Device sync keeps one JSON file per AniList account here, on the aniziq-sync volume
+# (docker-compose.yml). Owned by the server's user, so a new, empty volume starts writable.
+RUN mkdir -p /data/sync && chown -R extractor:extractor /data
+ENV SYNC_DIR=/data/sync
 
 EXPOSE 3232
 

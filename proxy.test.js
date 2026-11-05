@@ -118,6 +118,23 @@ test('routes refuse foreign pages and private targets', async (t) => {
     assert.equal((await fetch(page)).status, 403); // a native client passes the gate, a private target doesn't
 });
 
+test('CORS preflights: the dev web build may send Authorization, other sites get no headers', async (t) => {
+    const base = await serve(t, (app) => app.use(proxy.cors));
+    const preflight = (origin) => fetch(`${base}/sync`, {
+        method: 'OPTIONS',
+        headers: { Origin: origin, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
+    });
+    const dev = await preflight('http://localhost:8791');
+    assert.equal(dev.status, 204);
+    assert.equal(dev.headers.get('access-control-allow-origin'), 'http://localhost:8791');
+    assert.match(dev.headers.get('access-control-allow-headers'), /\bAuthorization\b/);
+    assert.equal(dev.headers.get('access-control-max-age'), '600');
+    const evil = await preflight('https://evil.example');
+    assert.equal(evil.status, 204);
+    assert.equal(evil.headers.get('access-control-allow-origin'), null);
+    assert.equal(evil.headers.get('access-control-allow-headers'), null);
+});
+
 test('links follow X-Forwarded-* and ignore junk', () => {
     const req = (headers) => ({ protocol: 'http', get: (h) => ({ host: '192.168.40.88:3232', ...headers })[h.toLowerCase()] });
     assert.equal(proxy.publicBase(req({})), 'http://192.168.40.88:3232');

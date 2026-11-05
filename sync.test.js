@@ -1,0 +1,421 @@
+// `npm test`. sync.js: validation, merging, paging, pruning, the viewer cache, and /sync end to
+// end against a stand-in AniList on loopback with a temporary SYNC_DIR. No network, no Chrome.
+const test = require('node:test');
+const assert = require('node:assert');
+const fs = require('fs');
+const http = require('http');
+const os = require('os');
+const path = require('path');
+const express = require('express');
+const proxy = require('./proxy');
+const sync = require('./sync');
+
+const { cleanEntry, mergeInto, changesSince, prune, emptyDoc, viewerLookup, anilistUrl, LIMITS } = sync;
+
+// The wire example from the devices spec. desktop-rs's devsync tests use these two literals as
+// they are, so a change here is a protocol change.
+const REQUEST_FIXTURE = '{"v":1,"user":1001,"epoch":"9f2c4e1ab37d5e60","since":41,"changes":{"history":[{"id":21,"at":1762345678901,"data":{"title":"ONE PIECE","imageUrl":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21.jpg","episode":1100,"totalEpisodes":1155,"positionMs":754000,"durationMs":1420000,"device":"pc"}}],"saved":[{"id":1535,"at":1762345600000,"deleted":true}],"hidden":[{"id":7,"at":1762345000000,"data":{"episode":4}}]}}';
+const REPLY_FIXTURE = '{"v":1,"user":1001,"epoch":"9f2c4e1ab37d5e60","cursor":44,"more":false,"skipped":0,"changes":{"history":[{"id":21,"at":1762345678901,"data":{"title":"ONE PIECE","imageUrl":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21.jpg","episode":1100,"totalEpisodes":1155,"positionMs":754000,"durationMs":1420000,"device":"pc"}}],"saved":[{"id":1535,"at":1762345600000,"deleted":true}],"hidden":[{"id":7,"at":1762345000000,"data":{"episode":4}}]}}';
+const FIXTURE_NOW = 1762345679012;
+
+const NOW = 1_800_000_000_000;
+const DAY = 24 * 60 * 60 * 1000;
+const TOK_A = 'tok-a-000000000000000000'; // device A of account 1001
+const TOK_B = 'tok-b-000000000000000000'; // device B of account 1001
+const TOK_C = 'tok-c-000000000000000000'; // account 3003
+
+const watch = (id, at, extra = {}) => ({
+    id, at, data: { title: `Show ${id}`, imageUrl: '', episode: 1, totalEpisodes: 12, positionMs: 1000, durationMs: 1440000, device: 'pc', ...extra },
+});
+const card = (id, at) => ({ id, at, data: { title: `Show ${id}`, imageUrl: '', subtitle: 'TV · 2024' } });
+const ask = (user, epoch, since, changes = {}) => ({ v: 1, user, epoch, since, changes });
+
+// A stand-in AniList on loopback: counts calls, knows three tokens, refuses the rest as AniList
+// does (HTTP 400 "Invalid token"), and answers 500 while `down`.
+async function standIn(t) {
+    const ids = { [TOK_A]: 1001, [TOK_B]: 1001, [TOK_C]: 3003 };
+    const anilist = { calls: 0, down: false };
+    const server = http.createServer((req, res) => {
+        req.resume();
+        req.on('end', () => {
+            anilist.calls += 1;
+            res.setHeader('Content-Type', 'application/json');
+            if (anilist.down) {
+                res.statusCode = 500;
+                return res.end('{}');
+            }
+            const id = ids[(req.headers.authorization || '').replace(/^Bearer /, '')];
+            if (!id) {
+                res.statusCode = 400;
+                return res.end(JSON.stringify({ errors: [{ message: 'Invalid token', status: 400 }], data: null }));
+            }
+            res.end(JSON.stringify({ data: { Viewer: { id } } }));
+        });
+    });
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    anilist.url = `http://127.0.0.1:${server.address().port}/`;
+    return anilist;
+}
+
+function tempDir(t) {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'aniziq-sync-'));
+    t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+    return dir;
+}
+
+// An app wired like server.js: CORS first, then /sync.
+async function syncServer(t, opts) {
+    const app = express();
+    app.use(proxy.cors);
+    const mounted = sync.mount(app, opts);
+    const server = await new Promise((resolve) => { const s = app.listen(0, '127.0.0.1', () => resolve(s)); });
+    t.after(() => { server.closeAllConnections(); server.close(); });
+    return { base: `http://127.0.0.1:${server.address().port}`, ...mounted };
+}
+
+const post = (base, token, body, headers = {}) => fetch(`${base}/sync`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}), ...headers },
+    body: typeof body === 'string' ? body : JSON.stringify(body),
+});
+const call = async (...args) => {
+    const r = await post(...args);
+    return { status: r.status, headers: r.headers, body: await r.json() };
+};
+const readDoc = (dir, user) => JSON.parse(fs.readFileSync(path.join(dir, `${user}.json`), 'utf8'));
+
+test('cleanEntry keeps what syncs and refuses what is malformed', () => {
+    const tv = { title: 'ONE PIECE', imageUrl: 'https://s4.anilist.co/file/a.jpg', episode: 3, totalEpisodes: 0, positionMs: 1, durationMs: 2, device: 'tv' };
+    assert.deepEqual(cleanEntry('history', { id: 21, at: 5, extra: 1, data: { ...tv, junk: true } }, NOW), { id: 21, at: 5, data: tv });
+    const saved = { title: 'A', imageUrl: '', subtitle: 'TV', score: 87 };
+    assert.deepEqual(cleanEntry('saved', { id: 1, at: 1, data: saved }, NOW), { id: 1, at: 1, data: saved });
+    assert.deepEqual(cleanEntry('saved', { id: 1, at: 1, data: { title: 'A', score: null } }, NOW).data, { title: 'A', imageUrl: '', subtitle: '' });
+    assert.deepEqual(cleanEntry('hidden', { id: 7, at: 1, data: { episode: 4 } }, NOW), { id: 7, at: 1, data: { episode: 4 } });
+
+    assert.equal(cleanEntry('saved', { id: 1, at: 1, data: { title: 'x'.repeat(400), subtitle: 'y'.repeat(400) } }, NOW).data.title.length, 300);
+    const emoji = cleanEntry('saved', { id: 1, at: 1, data: { title: '😀'.repeat(301) } }, NOW).data.title;
+    assert.equal(Array.from(emoji).length, 300); // whole characters, no half surrogate
+    const images = [
+        'file:///etc/passwd', 'javascript:alert(1)', 'http://s4.anilist.co/a.jpg', 'https://evil.example/a.jpg',
+        'https://s4.anilist.co.evil.example/a.jpg', `https://s4.anilist.co/${'a'.repeat(1000)}`, 42,
+    ];
+    for (const url of images) assert.equal(cleanEntry('history', watch(21, 1, { imageUrl: url }), NOW).data.imageUrl, '', String(url));
+    assert.equal(cleanEntry('history', watch(21, 1, { device: 'phone' }), NOW).data.device, '');
+
+    for (const id of [0, -1, 1.5, '21', 2 ** 31, null]) assert.equal(cleanEntry('history', watch(id, 1), NOW), null, `id ${id}`);
+    for (const at of [-1, 1.5, '5', null, undefined]) assert.equal(cleanEntry('history', watch(1, at), NOW), null, `at ${at}`);
+    const refused = [
+        ['history', { id: 1, at: 1 }], ['history', { id: 1, at: 1, data: [] }], ['history', watch(1, 1, { title: '' })],
+        ['history', watch(1, 1, { title: '   ' })], ['saved', { id: 1, at: 1, data: { subtitle: 'x' } }],
+        ['history', watch(1, 1, { episode: 100001 })], ['history', watch(1, 1, { positionMs: -5 })],
+        ['history', watch(1, 1, { durationMs: 172800001 })], ['saved', { id: 1, at: 1, data: { title: 'A', score: 101 } }],
+        ['hidden', { id: 1, at: 1, data: { episode: 'x' } }], ['history', 'nope'], ['history', { ...watch(1, 1), deleted: 'yes' }],
+    ];
+    for (const [kind, e] of refused) assert.equal(cleanEntry(kind, e, NOW), null, JSON.stringify(e));
+
+    assert.deepEqual(cleanEntry('saved', { id: 9, at: 3, deleted: true, data: { title: 'A' } }, NOW), { id: 9, at: 3, deleted: true });
+    assert.equal(cleanEntry('hidden', { id: 9, at: NOW + 10 * 60_000, deleted: true }, NOW).at, NOW + 5 * 60_000);
+    assert.equal(cleanEntry('history', watch(9, NOW + 60_000), NOW).at, NOW + 60_000);
+});
+
+test('mergeInto: the later at wins, ties keep the stored entry', () => {
+    const doc = emptyDoc(1001);
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100)] }, NOW), { changed: 1, skipped: 0 });
+    assert.equal(doc.rev, 1);
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100, { episode: 9 })] }, NOW), { changed: 0, skipped: 0 });
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 99, { episode: 9 })] }, NOW), { changed: 0, skipped: 0 });
+    assert.deepEqual([doc.rev, doc.history[21].data.episode], [1, 1]);
+    mergeInto(doc, { history: [watch(21, 101, { episode: 2 })] }, NOW);
+    assert.deepEqual([doc.rev, doc.history[21].rev, doc.history[21].data.episode], [2, 2, 2]);
+
+    mergeInto(doc, { saved: [card(5, 10)] }, NOW);
+    mergeInto(doc, { saved: [{ id: 5, at: 11, deleted: true }] }, NOW);
+    assert.deepEqual(doc.saved[5], { at: 11, rev: 4, deleted: true });
+    mergeInto(doc, { saved: [card(5, 10)] }, NOW); // older data loses to the tombstone
+    assert.equal(doc.saved[5].deleted, true);
+    mergeInto(doc, { saved: [card(5, 12)] }, NOW); // newer data beats it
+    assert.deepEqual(doc.saved[5], { at: 12, rev: 5, data: card(5, 12).data });
+
+    const batch = { history: [watch(1, 1), { id: 0, at: 1 }], hidden: [{ id: 2, at: 1, data: { episode: 1 } }], other: [1, 2] };
+    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 2, skipped: 1 });
+    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 0, skipped: 1 });
+    assert.equal(doc.rev, 7);
+});
+
+test('changesSince pages in rev order', () => {
+    const doc = emptyDoc(1001);
+    mergeInto(doc, { history: [watch(1, 1), watch(2, 2)], saved: [card(3, 3), { id: 4, at: 4, deleted: true }], hidden: [{ id: 5, at: 5, data: { episode: 2 } }] }, NOW);
+    const all = changesSince(doc, 0, 1000);
+    assert.deepEqual([all.cursor, all.more], [5, false]);
+    assert.deepEqual(all.changes.saved, [{ id: 3, at: 3, data: card(3, 3).data }, { id: 4, at: 4, deleted: true }]);
+    assert.deepEqual(all.changes.hidden, [{ id: 5, at: 5, data: { episode: 2 } }]);
+
+    const first = changesSince(doc, 0, 2);
+    assert.deepEqual([first.more, first.cursor, first.changes.history.map((e) => e.id)], [true, 2, [1, 2]]);
+    const second = changesSince(doc, first.cursor, 2);
+    assert.deepEqual([second.more, second.cursor, second.changes.saved.map((e) => e.id)], [true, 4, [3, 4]]);
+    const last = changesSince(doc, second.cursor, 2);
+    assert.deepEqual([last.more, last.cursor, last.changes.hidden.map((e) => e.id)], [false, 5, [5]]);
+    assert.deepEqual(changesSince(doc, 5, 2), { changes: { history: [], saved: [], hidden: [] }, cursor: 5, more: false });
+
+    mergeInto(doc, { history: [watch(1, 9)] }, NOW); // a newer position comes out after the cursor
+    assert.deepEqual(changesSince(doc, 5).changes.history.map((e) => e.id), [1]);
+});
+
+test('prune drops year-old tombstones, then trims the oldest entries over the cap', () => {
+    const doc = emptyDoc(1001);
+    mergeInto(doc, { saved: [{ id: 1, at: NOW - 366 * DAY, deleted: true }, { id: 2, at: NOW - 364 * DAY, deleted: true }, card(3, NOW - 900 * DAY)] }, NOW);
+    assert.equal(prune(doc, NOW), 1);
+    assert.deepEqual(Object.keys(doc.saved), ['2', '3']); // live entries stay however old
+
+    const n = LIMITS.stored;
+    const big = emptyDoc(1001);
+    const live = Array.from({ length: n }, (_, i) => watch(i + 1, NOW - DAY + i));
+    mergeInto(big, { history: [...live, { id: n + 1, at: NOW, deleted: true }, { id: n + 2, at: NOW - 5, deleted: true }] }, NOW);
+    assert.equal(prune(big, NOW), 2);
+    assert.equal(Object.keys(big.history).length, n);
+    assert.ok(!big.history[n + 1] && !big.history[n + 2]); // tombstones go first
+    mergeInto(big, { history: [watch(n + 3, NOW)] }, NOW);
+    assert.equal(prune(big, NOW), 1);
+    assert.ok(!big.history[1] && big.history[2] && big.history[n + 3]); // then the oldest live entry
+});
+
+test('viewerLookup: one AniList call per token, kept by hash, failures not kept', async () => {
+    let t = 1_000_000;
+    let mode = 'ok';
+    const calls = [];
+    const fetchImpl = async (url, init) => {
+        calls.push(init.headers.Authorization);
+        assert.deepEqual(JSON.parse(init.body), { query: 'query { Viewer { id } }' });
+        if (mode === 'network') throw new TypeError('fetch failed');
+        if (mode === '500') return new Response('<html>', { status: 500 });
+        if (init.headers.Authorization === 'Bearer refused-token-000000000') {
+            return new Response(JSON.stringify({ errors: [{ message: 'Invalid token', status: 400 }], data: null }), { status: 400 });
+        }
+        if (init.headers.Authorization === 'Bearer expired-token-000000000') return new Response('', { status: 401 });
+        return new Response(JSON.stringify({ data: { Viewer: { id: 1001 } } }), { status: 200 });
+    };
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl, now: () => t });
+
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    assert.equal(calls.length, 1);
+    assert.deepEqual(await Promise.all([lookup.idFor(TOK_B), lookup.idFor(TOK_B)]), [1001, 1001]);
+    assert.equal(calls.length, 2);
+
+    await assert.rejects(lookup.idFor('refused-token-000000000'), { status: 401 });
+    t += 59_000;
+    await assert.rejects(lookup.idFor('refused-token-000000000'), { status: 401 });
+    assert.equal(calls.length, 3);
+    t += 2_000;
+    await assert.rejects(lookup.idFor('refused-token-000000000'), { status: 401 });
+    assert.equal(calls.length, 4);
+    await assert.rejects(lookup.idFor('expired-token-000000000'), { status: 401 });
+    await assert.rejects(lookup.idFor('expired-token-000000000'), { status: 401 });
+    assert.equal(calls.length, 5);
+
+    t = 1_000_000 + 10 * 60_000 + 1; // the id is kept 10 minutes
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    assert.equal(calls.length, 6);
+
+    mode = '500';
+    await assert.rejects(lookup.idFor(TOK_C), { status: 503 });
+    mode = 'network';
+    await assert.rejects(lookup.idFor(TOK_C), { status: 503 });
+    mode = 'ok';
+    assert.equal(await lookup.idFor(TOK_C), 1001);
+    assert.equal(calls.length, 9);
+
+    for (const key of lookup.cache.keys()) assert.match(key, /^[0-9a-f]{64}$/);
+    assert.ok(!JSON.stringify([...lookup.cache]).includes('tok-'));
+});
+
+test('viewerLookup: at most 20 AniList calls a minute for unknown tokens; test tokens never go to AniList', async () => {
+    let t = 0;
+    let calls = 0;
+    const fetchImpl = async () => {
+        calls += 1;
+        return new Response(JSON.stringify({ errors: [{ message: 'Invalid token' }] }), { status: 400 });
+    };
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl, now: () => t });
+    for (let i = 0; i < 20; i++) await assert.rejects(lookup.idFor(`random-token-${i}-0000000000`), { status: 401 });
+    await assert.rejects(lookup.idFor('random-token-20-0000000000'), { status: 503 });
+    await assert.rejects(lookup.idFor('random-token-3-0000000000'), { status: 401 }); // cached refusals still answer
+    assert.equal(calls, 20);
+    t += 60_000;
+    await assert.rejects(lookup.idFor('random-token-21-0000000000'), { status: 401 });
+    assert.equal(calls, 21);
+
+    const real = viewerLookup({ fetchImpl: async () => assert.fail('a fake- token was sent to AniList') });
+    await assert.rejects(real.idFor('fake-tester-pc-0000001'), { status: 401 });
+});
+
+test('ANILIST_URL: AniList itself or a loopback stand-in, nothing else', () => {
+    assert.equal(anilistUrl(undefined), 'https://graphql.anilist.co');
+    assert.equal(anilistUrl('https://graphql.anilist.co/'), 'https://graphql.anilist.co');
+    for (const u of ['http://127.0.0.1:3299/', 'http://localhost:3299', 'http://[::1]:3299/', 'http://127.0.0.2:1/x']) {
+        assert.notEqual(anilistUrl(u), 'https://graphql.anilist.co', u);
+    }
+    const refused = [
+        'http://graphql.anilist.co/', 'https://graphql.anilist.co/x', 'https://evil.example/', 'http://192.168.40.88:3299/',
+        'http://10.0.2.2:3299/', 'http://u:p@127.0.0.1/', 'file:///x', 'nonsense', 'https://graphql.anilist.co.evil.example/',
+    ];
+    for (const u of refused) assert.equal(anilistUrl(u), 'https://graphql.anilist.co', u);
+});
+
+test('/sync end to end: push, pull, tombstones and the checks', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const { base, ready } = await syncServer(t, { dir, anilistUrl: anilist.url, now: () => NOW });
+    const at = (n) => NOW - 10_000 + n; // recent: tombstones older than a year are pruned
+    assert.equal(ready, true);
+
+    assert.deepEqual((await call(base, null, ask(1001, '', 0))).body, { status: 'error', error: 'sign-in required' });
+    const short = await post(base, null, ask(1001, '', 0), { Authorization: 'Bearer short' });
+    assert.equal(short.status, 401);
+    assert.equal(anilist.calls, 0);
+
+    const a1 = await call(base, TOK_A, ask(1001, '', 0, { history: [watch(21, at(1000))], saved: [card(1535, at(1000))] }));
+    assert.equal(a1.status, 200);
+    assert.deepEqual([a1.body.v, a1.body.user, a1.body.cursor, a1.body.more, a1.body.skipped], [1, 1001, 2, false, 0]);
+    assert.match(a1.body.epoch, /^[0-9a-f]{16}$/);
+    assert.deepEqual(a1.body.changes.history, [watch(21, at(1000))]); // accepted entries come back
+    const { epoch } = a1.body;
+    assert.ok(!fs.readFileSync(path.join(dir, '1001.json'), 'utf8').includes('tok-a'));
+    assert.deepEqual(fs.readdirSync(dir), ['1001.json']); // no .tmp left behind
+
+    const b1 = await call(base, TOK_B, ask(1001, '', 0));
+    assert.deepEqual([b1.body.epoch, b1.body.cursor, b1.body.changes.history.length, b1.body.changes.saved.length], [epoch, 2, 1, 1]);
+
+    const b2 = await call(base, TOK_B, ask(1001, epoch, 2, { saved: [{ id: 1535, at: at(2000), deleted: true }] }));
+    assert.equal(b2.body.cursor, 3);
+    const a2 = await call(base, TOK_A, ask(1001, epoch, 2));
+    assert.deepEqual(a2.body.changes, { history: [], saved: [{ id: 1535, at: at(2000), deleted: true }], hidden: [] });
+
+    // An older position from a device with a stale cursor loses, and it gets the stored one back.
+    const a3 = await call(base, TOK_A, ask(1001, epoch, 0, { history: [watch(21, at(500), { episode: 7 })] }));
+    assert.deepEqual(a3.body.changes.history, [watch(21, at(1000))]);
+    assert.equal(a3.body.cursor, 3);
+
+    const before = fs.readFileSync(path.join(dir, '1001.json'), 'utf8');
+    const wrongUser = await call(base, TOK_A, ask(2002, epoch, 0, { history: [watch(99, at(5000))] }));
+    assert.equal(wrongUser.status, 409);
+    assert.equal(fs.readFileSync(path.join(dir, '1001.json'), 'utf8'), before);
+
+    const many = Array.from({ length: 501 }, (_, i) => card(i + 1, 1));
+    assert.deepEqual((await call(base, TOK_A, ask(1001, epoch, 3, { saved: many }))).body, { status: 'error', error: 'too many changes' });
+    const big = await call(base, TOK_A, JSON.stringify({ ...ask(1001, epoch, 3), pad: 'x'.repeat(1_100_000) }));
+    assert.deepEqual([big.status, big.body], [413, { status: 'error', error: 'too large' }]);
+    const garbled = await call(base, TOK_A, '{"v":1,');
+    assert.deepEqual([garbled.status, garbled.body], [400, { status: 'error', error: 'bad json' }]);
+    for (const body of [{ v: 2, user: 1001 }, { v: 1, user: '1001' }, { v: 1, user: 1001, since: -1 }, { v: 1, user: 1001, changes: { saved: {} } }, []]) {
+        assert.equal((await call(base, TOK_A, body)).status, 400, JSON.stringify(body));
+    }
+    assert.equal(fs.readFileSync(path.join(dir, '1001.json'), 'utf8'), before);
+
+    const refused = await call(base, 'unknown-token-000000000', ask(1001, '', 0));
+    assert.deepEqual([refused.status, refused.body.error], [401, 'sign-in refused']);
+
+    const skipped = await call(base, TOK_A, ask(1001, epoch, 3, { hidden: [{ id: 7, at: at(3000), data: { episode: 2 } }, { id: -7, at: 1 }] }));
+    assert.deepEqual([skipped.body.skipped, skipped.body.cursor, skipped.body.changes.hidden.length], [1, 4, 1]);
+
+    // A different epoch (a new server URL, a lost file) gets everything.
+    const stranger = await call(base, TOK_A, ask(1001, 'ffffffffffffffff', 4));
+    assert.deepEqual([stranger.body.epoch, stranger.body.cursor], [epoch, 4]);
+    assert.deepEqual([stranger.body.changes.history.length, stranger.body.changes.saved.length, stranger.body.changes.hidden.length], [1, 1, 1]);
+    // A cursor past the file's rev (a restored file) changes the epoch and gets everything too.
+    const ahead = await call(base, TOK_A, ask(1001, epoch, 99));
+    assert.notEqual(ahead.body.epoch, epoch);
+    assert.equal(ahead.body.changes.history.length, 1);
+    assert.equal(readDoc(dir, 1001).epoch, ahead.body.epoch);
+
+    anilist.down = true;
+    const down = await call(base, TOK_C, ask(3003, '', 0));
+    assert.deepEqual([down.status, down.headers.get('retry-after'), down.body.status], [503, '30', 'error']);
+    assert.ok(!fs.existsSync(path.join(dir, '3003.json')));
+});
+
+test('/sync: pages from other sites are refused, the dev web build gets CORS', async (t) => {
+    const anilist = await standIn(t);
+    const { base } = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url });
+    assert.deepEqual((await call(base, TOK_A, ask(1001, '', 0), { Origin: 'https://evil.example' })).body, { status: 'error', error: 'forbidden' });
+    assert.equal((await post(base, TOK_A, ask(1001, '', 0), { 'Sec-Fetch-Site': 'cross-site' })).status, 403);
+    assert.equal(anilist.calls, 0);
+    const dev = await post(base, TOK_A, ask(1001, '', 0), { Origin: 'http://localhost:8791' });
+    assert.equal(dev.status, 200);
+    assert.equal(dev.headers.get('access-control-allow-origin'), 'http://localhost:8791');
+    const site = await post(base, TOK_A, ask(1001, '', 0), { Origin: 'https://aniziq.zikso.org', 'Sec-Fetch-Site': 'same-origin' });
+    assert.equal(site.status, 200);
+});
+
+test('/sync: 60 requests a minute per client, X-Real-IP only from a trusted proxy', async (t) => {
+    const anilist = await standIn(t);
+    const behindNginx = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, trusted: '127.0.0.1' });
+    const from = (base, ip) => post(base, null, ask(1001, '', 0), { 'X-Real-IP': ip });
+    for (let i = 0; i < 60; i++) assert.equal((await from(behindNginx.base, '10.0.0.61')).status, 401);
+    const limited = await from(behindNginx.base, '10.0.0.61');
+    assert.deepEqual([limited.status, (await limited.json()).status], [429, 'error']);
+    assert.equal((await from(behindNginx.base, '10.0.0.62')).status, 401);
+
+    const direct = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, trusted: '' });
+    for (let i = 0; i < 60; i++) assert.equal((await from(direct.base, `10.0.1.${i}`)).status, 401);
+    assert.equal((await from(direct.base, '10.0.1.200')).status, 429); // rotating the header doesn't help
+});
+
+test('/sync: storage that cannot be used, the account cap and the allowlist', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const notADir = path.join(dir, 'file');
+    fs.writeFileSync(notADir, 'x');
+    const off = await syncServer(t, { dir: notADir, anilistUrl: anilist.url });
+    assert.equal(off.ready, false);
+    assert.deepEqual(await call(off.base, TOK_A, ask(1001, '', 0)).then((r) => [r.status, r.body]), [500, { status: 'error', error: 'storage unavailable' }]);
+    assert.equal(anilist.calls, 0);
+
+    const full = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, maxUsers: 1 });
+    assert.equal((await call(full.base, TOK_A, ask(1001, '', 0))).status, 200);
+    assert.deepEqual(await call(full.base, TOK_C, ask(3003, '', 0)).then((r) => [r.status, r.body]), [403, { status: 'error', error: 'sync is full' }]);
+    assert.equal((await call(full.base, TOK_B, ask(1001, '', 0))).status, 200); // an account already there still syncs
+
+    const only = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, allow: [1001] });
+    assert.equal((await call(only.base, TOK_C, ask(3003, '', 0))).status, 403);
+    assert.equal((await call(only.base, TOK_A, ask(1001, '', 0))).status, 200);
+});
+
+test('/sync: an unreadable account file is set aside and started again', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    fs.writeFileSync(path.join(dir, '1001.json'), '{"v":1,"user":1001,');
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url });
+    const r = await call(base, TOK_A, ask(1001, 'aaaaaaaaaaaaaaaa', 5, { history: [watch(21, 1)] }));
+    assert.equal(r.status, 200);
+    assert.notEqual(r.body.epoch, 'aaaaaaaaaaaaaaaa');
+    assert.equal(r.body.cursor, 1);
+    assert.equal(fs.readdirSync(dir).filter((n) => n.startsWith('1001.json.bad-')).length, 1);
+    assert.equal(readDoc(dir, 1001).rev, 1);
+});
+
+test('/sync: parallel pushes for one account all land', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url });
+    const replies = await Promise.all(Array.from({ length: 20 }, (_, i) => call(base, TOK_A, ask(1001, '', 0, { history: [watch(i + 1, 1)] }))));
+    assert.ok(replies.every((r) => r.status === 200));
+    const doc = readDoc(dir, 1001);
+    assert.deepEqual([Object.keys(doc.history).length, doc.rev], [20, 20]);
+    assert.equal(anilist.calls, 1);
+});
+
+test('the wire fixture: the shared request goes in and the shared reply comes out', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const start = { v: 1, user: 1001, epoch: '9f2c4e1ab37d5e60', rev: 41, updatedAt: FIXTURE_NOW - 1000, history: {}, saved: {}, hidden: {} };
+    fs.writeFileSync(path.join(dir, '1001.json'), JSON.stringify(start));
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url, now: () => FIXTURE_NOW });
+    const r = await call(base, TOK_A, REQUEST_FIXTURE);
+    assert.equal(r.status, 200);
+    assert.deepEqual(r.body, JSON.parse(REPLY_FIXTURE));
+    const doc = readDoc(dir, 1001);
+    assert.deepEqual([doc.rev, doc.history[21].rev, doc.saved[1535].rev, doc.hidden[7].rev, doc.updatedAt], [44, 42, 43, 44, FIXTURE_NOW]);
+});

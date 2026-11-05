@@ -1,6 +1,6 @@
 const express = require('express');
 const https = require('https');
-const { allowedOrigin } = require('./proxy');
+const { cors } = require('./proxy');
 const puppeteer = require('puppeteer-extra');
 const StealthPlugin = require('puppeteer-extra-plugin-stealth');
 puppeteer.use(StealthPlugin());
@@ -66,18 +66,8 @@ async function paheApiCall(path) {
 const app = express();
 const PORT = process.env.PORT || 3232;
 
-// The AniZiQ browser build (desktop-rs, trunk serve) calls this server from a web page. Other
-// sites get no CORS headers, so they can't read an answer.
-app.use((req, res, next) => {
-    const origin = allowedOrigin(req.get('origin'));
-    res.vary('Origin');
-    if (origin) {
-        res.set('Access-Control-Allow-Origin', origin);
-        res.set('Access-Control-Allow-Headers', 'Content-Type, Range');
-    }
-    if (req.method === 'OPTIONS') return res.sendStatus(204);
-    next();
-});
+// The AniZiQ browser build calls this server from a web page (see proxy.cors).
+app.use(cors);
 
 let browser = null;
 
@@ -348,6 +338,9 @@ app.get('/animepahe/video', async (req, res) => {
 
 require('./pairing').mount(app);
 
+// Continue on any device: progress, Saved and Continue Watching per AniList account.
+const sync = require('./sync').mount(app);
+
 // ── Miruro (AniList-native, browser-driven) ─────────────────────────
 const { resolveMiruroStream, streamAnswer, lookups } = require('./miruro');
 
@@ -385,14 +378,16 @@ app.get('/miruro/stream', async (req, res) => {
 // HLS proxy for the browser build (Referer, CORS, fake-header stripping).
 require('./proxy').mount(app);
 
-// The apps' "Test" in Settings → Streaming reads this. lookups holds only times and an error word.
+// The apps' "Test" in Settings → Streaming reads this. lookups holds only times and an error word;
+// sync says whether /sync can store anything.
 app.get('/health', (req, res) => {
     res.set('Cache-Control', 'no-store');
-    res.json({ status: 'ok', uptime: process.uptime(), now: Date.now(), lookups: lookups.snapshot() });
+    res.json({ status: 'ok', uptime: process.uptime(), now: Date.now(), lookups: lookups.snapshot(), sync: sync.ready ? 'ok' : 'off' });
 });
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log(`Sozo Video Extractor running on port ${PORT}`);
+    if (process.env.TRUSTED_PROXIES) console.log(`[TRUST] X-Real-IP is believed from ${process.env.TRUSTED_PROXIES}`);
 });
 
 process.on('SIGTERM', async () => {

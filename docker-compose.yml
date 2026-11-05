@@ -7,6 +7,14 @@ services:
     environment:
       - PORT=3232
       - NODE_ENV=production
+      - SYNC_DIR=/data/sync
+      # Optional (README.md): only these AniList accounts may sync. Unset: any, up to 50 files.
+      # - SYNC_USERS=<AniList id>,<AniList id>
+      # Optional (README.md): the site's nginx as this server sees it, so its X-Real-IP counts.
+      # - TRUSTED_PROXIES=<address or range>
+    volumes:
+      # Device sync: one JSON file per AniList account, kept across redeploys.
+      - aniziq-sync:/data
     deploy:
       resources:
         limits:
@@ -16,3 +24,6 @@ services:
           memory: 512M
     # Larger /dev/shm keeps Chromium stable with multiple tabs.
     shm_size: '512m'
+
+volumes:
+  aniziq-sync:

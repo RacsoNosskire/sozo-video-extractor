@@ -96,6 +96,12 @@ test('cleanEntry keeps what syncs and refuses what is malformed', () => {
     assert.equal(cleanEntry('saved', { id: 1, at: 1, data: { title: 'x'.repeat(400), subtitle: 'y'.repeat(400) } }, NOW).data.title.length, 300);
     const emoji = cleanEntry('saved', { id: 1, at: 1, data: { title: '😀'.repeat(301) } }, NOW).data.title;
     assert.equal(Array.from(emoji).length, 300); // whole characters, no half surrogate
+    // A lone surrogate, which the apps' JSON reader refuses, becomes U+FFFD, or spoils an image.
+    const lone = { title: 'A\ud800B 😀', subtitle: '\udc00', imageUrl: 'https://s4.anilist.co/x\ud800' };
+    assert.deepEqual(cleanEntry('saved', { id: 1, at: 1, data: lone }, NOW).data, { title: 'A�B 😀', imageUrl: '', subtitle: '�' });
+    const history = cleanEntry('history', watch(1, 1, lone), NOW).data;
+    assert.deepEqual([history.title, history.imageUrl], ['A�B 😀', '']);
+    assert.equal(cleanEntry('history', watch(1, 1, { title: `${'x'.repeat(299)}\ud83d` }), NOW).data.title, `${'x'.repeat(299)}�`);
     const images = [
         'file:///etc/passwd', 'javascript:alert(1)', 'http://s4.anilist.co/a.jpg', 'https://evil.example/a.jpg',
         'https://s4.anilist.co.evil.example/a.jpg', `https://s4.anilist.co/${'a'.repeat(1000)}`, 42,
@@ -430,6 +436,24 @@ test('/sync: pages from other sites are refused, the dev web build gets CORS', a
     assert.equal(dev.headers.get('access-control-allow-origin'), 'http://localhost:8791');
     const site = await post(base, TOK_A, ask(1001, '', 0), { Origin: 'https://aniziq.zikso.org', 'Sec-Fetch-Site': 'same-origin' });
     assert.equal(site.status, 200);
+});
+
+test('/sync: a lone surrogate sent as \\ud800 is stored and sent back as U+FFFD', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url, now: () => NOW });
+    // JSON escapes as a hand-written request may send them; \ud83d\ude00 is a whole emoji.
+    const saved = '{"id":5,"at":1,"data":{"title":"A\\ud800B \\ud83d\\ude00","subtitle":"\\udc00","imageUrl":"https://s4.anilist.co/x\\ud800"}}';
+    const history = '{"id":21,"at":1,"data":{"title":"\\udfff","imageUrl":"https://s4.anilist.co/a.jpg","episode":1}}';
+    const r = await post(base, TOK_A, `{"v":1,"user":1001,"epoch":"","since":0,"changes":{"saved":[${saved}],"history":[${history}]}}`);
+    const text = await r.text();
+    assert.equal(r.status, 200);
+    const escaped = /\\ud[89a-f][0-9a-f]{2}/i;
+    assert.doesNotMatch(text, escaped);
+    assert.doesNotMatch(fs.readFileSync(path.join(dir, '1001.json'), 'utf8'), escaped);
+    const { changes } = JSON.parse(text);
+    assert.deepEqual(changes.saved[0].data, { title: 'A\uFFFDB 😀', imageUrl: '', subtitle: '\uFFFD' });
+    assert.deepEqual([changes.history[0].data.title, changes.history[0].data.imageUrl], ['\uFFFD', 'https://s4.anilist.co/a.jpg']);
 });
 
 test('/sync: 60 requests a minute per client, X-Real-IP only from a trusted proxy', async (t) => {

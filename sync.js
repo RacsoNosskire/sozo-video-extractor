@@ -49,10 +49,11 @@ class HttpError extends Error {
 
 const isObject = (v) => typeof v === 'object' && v !== null && !Array.isArray(v);
 const isInt = (v, min, max) => Number.isSafeInteger(v) && v >= min && v <= max;
-// Cut by characters, not UTF-16 units, so no half of an emoji is left over.
-const text = (v, max) => (typeof v === 'string' ? Array.from(v).slice(0, max).join('') : '');
-// Every device fetches the image, so only AniList's own CDN.
-const image = (v) => (typeof v === 'string' && v.length <= 1000 && v.startsWith(IMAGES) ? v : '');
+// Cut by characters, not UTF-16 units, so no half of an emoji is left over; a lone surrogate that
+// came in is U+FFFD by then, as the apps' JSON reader refuses one (and with it the whole reply).
+const text = (v, max) => (typeof v === 'string' ? Array.from(v.toWellFormed()).slice(0, max).join('') : '');
+// Every device fetches the image, so only AniList's own CDN, and nothing with a lone surrogate.
+const image = (v) => (typeof v === 'string' && v.length <= 1000 && v.isWellFormed() && v.startsWith(IMAGES) ? v : '');
 // A missing count is 0; a count out of range spoils the entry (NaN).
 const count = (v, max) => (v === undefined || v === null ? 0 : isInt(v, 0, max) ? v : NaN);
 

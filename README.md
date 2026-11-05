@@ -104,11 +104,12 @@ These two are the shared wire fixture: `sync.test.js` holds them in full (`REQUE
   (a file restored from something older) makes a new epoch first, though not always for a file put
   back by hand (see Storage). Either way the devices see a new epoch and send their entries again,
   so a lost server copy fills itself.
-- Checks: unknown fields go; `title` and `subtitle` are cut to 300 characters, and history and saved
-  need a title; `imageUrl` stays only when it starts with `https://s4.anilist.co/` (AniList's CDN,
-  every device fetches it) and is at most 1000 characters, else it is stored as `""`; `episode` and
-  `totalEpisodes` 0–100000, `positionMs` and `durationMs` 0–172800000, `score` 0–100, `device` one of
-  the three or `""`.
+- Checks: unknown fields go; `title` and `subtitle` are cut to 300 characters, and a lone UTF-16
+  surrogate in them (a `\ud800` with no partner: the apps' JSON reader refuses one, and with it the
+  whole reply) becomes U+FFFD; history and saved need a title; `imageUrl` stays only when it starts
+  with `https://s4.anilist.co/` (AniList's CDN, every device fetches it), is at most 1000 characters
+  and has no lone surrogate, else it is stored as `""`; `episode` and `totalEpisodes` 0–100000,
+  `positionMs` and `durationMs` 0–172800000, `score` 0–100, `device` one of the three or `""`.
 - Kept: tombstones for a year. Past 3000 entries of a kind, tombstones go first (oldest first), then
   the live entries with the oldest `at`.
 

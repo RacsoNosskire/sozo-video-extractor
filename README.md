@@ -29,7 +29,7 @@ Environment:
 | `SYNC_USERS` | unset (any account) | Comma-separated AniList ids that may sync, e.g. `1001,2002`; everyone else gets 403. Set it but name no id and nobody syncs. |
 | `SYNC_MAX_USERS` | `50` | Account files at most; a new account past it gets 403 "sync is full". |
 | `ANILIST_URL` | `https://graphql.anilist.co` | Where `/sync` checks sign-ins. Only AniList itself or a loopback address (`http://127.0.0.1:3299/`, the fake AniList) is accepted; anything else is refused with an error line and AniList is used. An override is logged as a WARNING at start. Local testing only: never in docker-compose.yml. |
-| `TRUSTED_PROXIES` | unset (trust none) | Comma-separated addresses or CIDR ranges whose `X-Real-IP` names the real client (the site's nginx). From anyone else the header is ignored and the rate limits key on the socket's address, so a LAN client can't dodge them by rotating it. An ignored header is logged once per address: `[TRUST] X-Real-IP from 172.18.0.1 ignored (not in TRUSTED_PROXIES)`. |
+| `TRUSTED_PROXIES` | unset (trust none) | Comma-separated addresses or CIDR ranges whose `X-Real-IP` names the real client (the site's nginx). From anyone else the header is ignored and the rate limits key on the socket's address, so a LAN client can't dodge them by rotating it. An ignored header is logged once per address, by the rate-limited routes (`/sync`, `/auth/*`): `[TRUST] X-Real-IP from 172.18.0.1 ignored (not in TRUSTED_PROXIES)`. |
 
 ## `/miruro/stream`
 
@@ -179,11 +179,14 @@ What to do at ship time (with the user's go), in this order:
    environment (commented there). Unset, any AniList account may create a file until there are 50.
 4. Optional: `TRUSTED_PROXIES`. Until it is set, everything the site's nginx forwards shares one rate
    limit (60 `/sync` requests a minute for all of the site's visitors together; plenty for a
-   household). After the deploy, use the site once and look for
-   `[TRUST] X-Real-IP from <address> ignored` in the container log: that address is the nginx as
-   this server sees it (a Docker bridge address such as 172.18.0.1). Put it in `TRUSTED_PROXIES` in
-   the compose environment and redeploy. Never a range the LAN's own devices use: they could then
-   write any `X-Real-IP`.
+   household). Only the rate-limited routes (`/sync`, `/auth/*`) log the address, so streaming
+   shows nothing. Once the new site is live, open it signed in with AniList (device sync is on by
+   default, so it calls `/x/sync`). Or, at any time after the extractor deploy, open
+   `https://aniziq.zikso.org/x/auth/pair` once; it only makes a pairing code that lapses after 5
+   minutes. Then look for `[TRUST] X-Real-IP from <address> ignored` in the container log: that
+   address is the nginx as this server sees it (a Docker bridge address such as 172.18.0.1). Put it
+   in `TRUSTED_PROXIES` in the compose environment and redeploy. Never a range the LAN's own devices
+   use: they could then write any `X-Real-IP`.
 5. Never set `ANILIST_URL` there: it is refused for anything but AniList and loopback anyway.
 
 Without a volume nothing is lost either: each redeploy would start an empty copy with a new epoch,

@@ -222,6 +222,41 @@ node dev/fake-anilist.js [--port 3299] [--lists [<name>=]<file>]... [--recs <fil
 - CORS for the dev web build (`http://localhost:8791`, `http://127.0.0.1:8791`).
 - One log line per request, with the viewer and never the token: `[FAKE ANILIST] Tester 1001: saved 154587 as PLANNING`.
 
+### Device CLI: `dev/device.js`
+
+Plays a third device against a **local** `/sync`: it refuses any base but `http://127.0.0.1`,
+`localhost` or `10.0.2.2`, so it can't touch the live server.
+
+```
+node dev/device.js [--base http://127.0.0.1:3232] [--token fake-tester-device-001] [--user <id>]
+                   [--device tv|pc|web] [--since <n>] <command>
+  pull                                      what changed since this device's last pull (its own pushes too)
+  watch <id> <ep> <posMs> <durMs> [title]   a watch position
+  save <id> <title>   |   unsave <id>       Saved
+  hide <id> <ep>      |   show <id>         Continue Watching
+```
+
+It prints each reply. `--user` defaults to the fake AniList's viewer for the token (1001 for the
+default `fake-tester-…` token), `--device` to `tv`. Its epoch and cursor live in the temp folder,
+one file per server, token and device kind, named by a hash (the token isn't in it); `--since 0`
+pulls everything.
+
+### A local run
+
+Two terminals, from `video-extractor` (PowerShell):
+
+```
+node dev/fake-anilist.js
+$env:ANILIST_URL='http://127.0.0.1:3299/'; $env:SYNC_DIR="$env:TEMP\aniziq-sync-run"; npm start
+```
+
+Then `curl.exe -s http://127.0.0.1:3232/health` shows `"sync":"ok"`, `node dev/device.js pull` prints
+an epoch and cursor 0, `node dev/device.js watch 21 5 600000 1420000 Test` writes
+`$env:TEMP\aniziq-sync-run\1001.json` (no token in it), and the next `pull` shows the entry. The apps
+point at it with their extractor URL setting (`http://127.0.0.1:3232`, or `http://10.0.2.2:3232` from
+the emulator) and `AZ_ANILIST_URL=http://127.0.0.1:3299/` with a `fake-…` token. Chrome starts only
+when an episode is requested.
+
 ### Ports used by local checks
 
 | Port | What |

@@ -99,10 +99,12 @@ function emptyDoc(user) {
 }
 
 // Last writer wins per entry: an incoming entry replaces the stored one only when its `at` is
-// later, so a tie (a re-send) changes nothing. Each accepted entry gets the next rev.
+// later, so a tie (a re-send) changes nothing. Each accepted entry gets the next rev. `lost` lists,
+// as { kind, id }, the valid entries that lost to a stored one as new or newer.
 function mergeInto(doc, changes, now) {
     let changed = 0;
     let skipped = 0;
+    const lost = [];
     for (const kind of KINDS) {
         const list = changes && Array.isArray(changes[kind]) ? changes[kind] : [];
         for (const raw of list) {
@@ -112,14 +114,20 @@ function mergeInto(doc, changes, now) {
                 continue;
             }
             const stored = doc[kind][e.id];
-            if (stored && !(e.at > stored.at)) continue;
+            if (stored && !(e.at > stored.at)) {
+                lost.push({ kind, id: e.id });
+                continue;
+            }
             doc.rev += 1;
             doc[kind][e.id] = e.deleted ? { at: e.at, rev: doc.rev, deleted: true } : { at: e.at, rev: doc.rev, data: e.data };
             changed += 1;
         }
     }
-    return { changed, skipped };
+    return { changed, skipped, lost };
 }
+
+// A stored entry as the reply carries it.
+const wire = (id, s) => (s.deleted ? { id, at: s.at, deleted: true } : { id, at: s.at, data: s.data });
 
 // The stored entries with rev > since, in rev order, at most `limit`; `more` says call again
 // from `cursor`.
@@ -131,7 +139,7 @@ function changesSince(doc, since, limit = LIMITS.reply) {
     all.sort((a, b) => a.s.rev - b.s.rev);
     const page = all.slice(0, limit);
     const changes = { history: [], saved: [], hidden: [] };
-    for (const { kind, id, s } of page) changes[kind].push(s.deleted ? { id, at: s.at, deleted: true } : { id, at: s.at, data: s.data });
+    for (const { kind, id, s } of page) changes[kind].push(wire(id, s));
     const more = all.length > page.length;
     return { changes, cursor: more ? page[page.length - 1].s.rev : doc.rev, more };
 }
@@ -438,8 +446,15 @@ function mount(app, opts = {}) {
             creating.delete(user);
         }
         const page = changesSince(doc, req.epoch === doc.epoch ? req.since : 0);
+        // For what lost to a stored entry, that entry, even from before `since`: the device takes
+        // it, so the copies agree (one whose clock runs behind would otherwise keep its own).
+        for (const { kind, id } of merged.lost) {
+            const s = doc[kind][id];
+            if (s && !page.changes[kind].some((e) => e.id === id)) page.changes[kind].push(wire(id, s));
+        }
         const sent = KINDS.reduce((n, k) => n + page.changes[k].length, 0);
-        const reply = { v: 1, user, epoch: doc.epoch, cursor: page.cursor, more: page.more, skipped: merged.skipped, changes: page.changes };
+        // `now` is this server's clock, for a device to tell how far off its own is.
+        const reply = { v: 1, user, epoch: doc.epoch, cursor: page.cursor, more: page.more, skipped: merged.skipped, now: t, changes: page.changes };
         return { reply, sent, ...merged };
     }
 

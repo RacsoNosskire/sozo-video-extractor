@@ -119,12 +119,13 @@ test('cleanEntry keeps what syncs and refuses what is malformed', () => {
     assert.equal(cleanEntry('history', watch(9, NOW + 60_000), NOW).at, NOW + 60_000);
 });
 
-test('mergeInto: the later at wins, ties keep the stored entry', () => {
+test('mergeInto: the later at wins, ties keep the stored entry, and what lost is named', () => {
     const doc = emptyDoc(1001);
-    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100)] }, NOW), { changed: 1, skipped: 0 });
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100)] }, NOW), { changed: 1, skipped: 0, lost: [] });
     assert.equal(doc.rev, 1);
-    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100, { episode: 9 })] }, NOW), { changed: 0, skipped: 0 });
-    assert.deepEqual(mergeInto(doc, { history: [watch(21, 99, { episode: 9 })] }, NOW), { changed: 0, skipped: 0 });
+    const lost21 = { changed: 0, skipped: 0, lost: [{ kind: 'history', id: 21 }] };
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 100, { episode: 9 })] }, NOW), lost21);
+    assert.deepEqual(mergeInto(doc, { history: [watch(21, 99, { episode: 9 })] }, NOW), lost21);
     assert.deepEqual([doc.rev, doc.history[21].data.episode], [1, 1]);
     mergeInto(doc, { history: [watch(21, 101, { episode: 2 })] }, NOW);
     assert.deepEqual([doc.rev, doc.history[21].rev, doc.history[21].data.episode], [2, 2, 2]);
@@ -132,14 +133,14 @@ test('mergeInto: the later at wins, ties keep the stored entry', () => {
     mergeInto(doc, { saved: [card(5, 10)] }, NOW);
     mergeInto(doc, { saved: [{ id: 5, at: 11, deleted: true }] }, NOW);
     assert.deepEqual(doc.saved[5], { at: 11, rev: 4, deleted: true });
-    mergeInto(doc, { saved: [card(5, 10)] }, NOW); // older data loses to the tombstone
+    assert.deepEqual(mergeInto(doc, { saved: [card(5, 10)] }, NOW).lost, [{ kind: 'saved', id: 5 }]); // older data loses to the tombstone
     assert.equal(doc.saved[5].deleted, true);
     mergeInto(doc, { saved: [card(5, 12)] }, NOW); // newer data beats it
     assert.deepEqual(doc.saved[5], { at: 12, rev: 5, data: card(5, 12).data });
 
     const batch = { history: [watch(1, 1), { id: 0, at: 1 }], hidden: [{ id: 2, at: 1, data: { episode: 1 } }], other: [1, 2] };
-    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 2, skipped: 1 });
-    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 0, skipped: 1 });
+    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 2, skipped: 1, lost: [] });
+    assert.deepEqual(mergeInto(doc, batch, NOW), { changed: 0, skipped: 1, lost: [{ kind: 'history', id: 1 }, { kind: 'hidden', id: 2 }] });
     assert.equal(doc.rev, 7);
 });
 
@@ -356,7 +357,7 @@ test('/sync end to end: push, pull, tombstones and the checks', async (t) => {
 
     const a1 = await call(base, TOK_A, ask(1001, '', 0, { history: [watch(21, at(1000))], saved: [card(1535, at(1000))] }));
     assert.equal(a1.status, 200);
-    assert.deepEqual([a1.body.v, a1.body.user, a1.body.cursor, a1.body.more, a1.body.skipped], [1, 1001, 2, false, 0]);
+    assert.deepEqual([a1.body.v, a1.body.user, a1.body.cursor, a1.body.more, a1.body.skipped, a1.body.now], [1, 1001, 2, false, 0, NOW]);
     assert.match(a1.body.epoch, /^[0-9a-f]{16}$/);
     assert.deepEqual(a1.body.changes.history, [watch(21, at(1000))]); // accepted entries come back
     const { epoch } = a1.body;
@@ -375,6 +376,10 @@ test('/sync end to end: push, pull, tombstones and the checks', async (t) => {
     const a3 = await call(base, TOK_A, ask(1001, epoch, 0, { history: [watch(21, at(500), { episode: 7 })] }));
     assert.deepEqual(a3.body.changes.history, [watch(21, at(1000))]);
     assert.equal(a3.body.cursor, 3);
+    // So does one with an up-to-date cursor (its clock runs behind); an older card gets the tombstone.
+    const a4 = await call(base, TOK_A, ask(1001, epoch, 3, { history: [watch(21, at(500), { episode: 7 })], saved: [card(1535, at(1500))] }));
+    assert.deepEqual(a4.body.changes, { history: [watch(21, at(1000))], saved: [{ id: 1535, at: at(2000), deleted: true }], hidden: [] });
+    assert.equal(a4.body.cursor, 3);
 
     const before = fs.readFileSync(path.join(dir, '1001.json'), 'utf8');
     const wrongUser = await call(base, TOK_A, ask(2002, epoch, 0, { history: [watch(99, at(5000))] }));
@@ -493,7 +498,9 @@ test('the wire fixture: the shared request goes in and the shared reply comes ou
     const { base } = await syncServer(t, { dir, anilistUrl: anilist.url, now: () => FIXTURE_NOW });
     const r = await call(base, TOK_A, REQUEST_FIXTURE);
     assert.equal(r.status, 200);
-    assert.deepEqual(r.body, JSON.parse(REPLY_FIXTURE));
+    const { now, ...reply } = r.body;
+    assert.equal(now, FIXTURE_NOW); // the server's clock, which the shared fixture leaves out
+    assert.deepEqual(reply, JSON.parse(REPLY_FIXTURE));
     const doc = readDoc(dir, 1001);
     assert.deepEqual([doc.rev, doc.history[21].rev, doc.saved[1535].rev, doc.hidden[7].rev, doc.updatedAt], [44, 42, 43, 44, FIXTURE_NOW]);
 });

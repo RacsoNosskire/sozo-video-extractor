@@ -81,11 +81,11 @@ POST /sync
 {"v":1,"user":1001,"epoch":"9f2c4e1ab37d5e60","since":41,"changes":{"history":[{"id":21,"at":1762345678901,"data":{"title":"ONE PIECE","imageUrl":"https://s4.anilist.co/file/anilistcdn/media/anime/cover/large/bx21.jpg","episode":1100,"totalEpisodes":1155,"positionMs":754000,"durationMs":1420000,"device":"pc"}}],"saved":[{"id":1535,"at":1762345600000,"deleted":true}],"hidden":[{"id":7,"at":1762345000000,"data":{"episode":4}}]}}
 
 200
-{"v":1,"user":1001,"epoch":"9f2c4e1ab37d5e60","cursor":44,"more":false,"skipped":0,"changes":{"history":[…],"saved":[…],"hidden":[…]}}
+{"v":1,"user":1001,"epoch":"9f2c4e1ab37d5e60","cursor":44,"more":false,"skipped":0,"now":1762345679012,"changes":{"history":[…],"saved":[…],"hidden":[…]}}
 ```
 
 These two are the shared wire fixture: `sync.test.js` holds them in full (`REQUEST_FIXTURE`,
-`REPLY_FIXTURE`), and the app's device-sync tests must use the same literals.
+`REPLY_FIXTURE`, which leaves out `now`), and the app's device-sync tests must use the same literals.
 
 - `user` is the signed-in viewer, checked against the token's account (409 when they differ).
   `epoch` and `since` are the server copy the device knows and the `cursor` it got last (`""`, `0`
@@ -95,8 +95,11 @@ These two are the shared wire fixture: `sync.test.js` holds them in full (`REQUE
   stored copy, so sending again changes nothing. `at` is clamped to 5 minutes past the server's
   clock. Each accepted entry gets the next `rev`.
 - The reply holds every stored entry with `rev > since`, the device's own accepted ones included,
-  in `rev` order and at most 1000; `more: true` means ask again with `since = cursor`. `skipped`
-  counts entries refused by the checks below; they never fail the request.
+  in `rev` order and at most 1000; `more: true` means ask again with `since = cursor`. After them
+  come the stored entries that beat one the device sent (as new or newer), whatever their `rev`: the
+  device takes them, so the copies agree even when its clock runs behind. `skipped` counts entries
+  refused by the checks below; they never fail the request. `now` is this server's clock (ms), for a
+  device to tell how far off its own is; apps that don't know it ignore it.
 - An `epoch` that isn't the server's is answered as `since = 0`. A `since` past the file's `rev`
   (a file restored from something older) makes a new epoch first. Either way the devices see a new
   epoch and send their entries again, so a lost server copy fills itself.

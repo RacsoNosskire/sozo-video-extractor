@@ -349,47 +349,46 @@ app.get('/animepahe/video', async (req, res) => {
 require('./pairing').mount(app);
 
 // ── Miruro (AniList-native, browser-driven) ─────────────────────────
-const { resolveMiruroStream } = require('./miruro');
+const { resolveMiruroStream, streamAnswer, lookups } = require('./miruro');
 
+// 200 with the versions the episode has; 404 no_track (with the other version, ready to play) or
+// not_found; 502 source_down; 504 timeout; 500. Each lookup is noted for /health, also one that
+// ends after its 504 went out.
 app.get('/miruro/stream', async (req, res) => {
     const anilistId = req.query.anilistId;
     const ep = parseInt(req.query.ep, 10) || 1;
     const type = (req.query.type === 'dub') ? 'dub' : 'sub';
     if (!anilistId) return res.status(400).json({ status: 'error', error: 'Missing anilistId' });
 
+    const send = (status, body) => {
+        if (!res.headersSent) res.status(status).json(body);
+    };
     const overallTimeout = setTimeout(() => {
-        if (!res.headersSent) res.status(504).json({ status: 'error', error: 'Extractor timeout' });
+        lookups.note(false, 'timeout');
+        send(504, { status: 'error', error: 'Extractor timeout', reason: 'timeout' });
     }, 70000);
     res.on('finish', () => clearTimeout(overallTimeout));
     res.on('close', () => clearTimeout(overallTimeout));
 
     try {
         const br = await getBrowser();
-        const result = await resolveMiruroStream(br, anilistId, ep, type);
-        if (result && result.videoUrl) {
-            res.json({
-                status: 'ok',
-                videoUrl: result.videoUrl,
-                referer: result.referer,
-                qualities: result.qualities || [],
-                subtitles: result.subtitles || [],
-                // Intro/outro of this exact video, seconds: [{kind:'op'|'ed', start, end}].
-                skips: result.skips || [],
-            });
-        } else {
-            res.status(404).json({ status: 'error', error: 'No stream found' });
-        }
+        const answer = streamAnswer(await resolveMiruroStream(br, anilistId, ep, type), type);
+        lookups.note(answer.ok, answer.error);
+        send(answer.status, answer.body);
     } catch (e) {
         console.error(`[MIRURO ERROR] ${e.message}`);
-        if (!res.headersSent) res.status(500).json({ status: 'error', error: e.message });
+        lookups.note(false, /timeout/i.test(e.message) ? 'timeout' : 'error');
+        send(500, { status: 'error', error: e.message });
     }
 });
 
 // HLS proxy for the browser build (Referer, CORS, fake-header stripping).
 require('./proxy').mount(app);
 
+// The apps' "Test" in Settings → Streaming reads this. lookups holds only times and an error word.
 app.get('/health', (req, res) => {
-    res.json({ status: 'ok', uptime: process.uptime() });
+    res.set('Cache-Control', 'no-store');
+    res.json({ status: 'ok', uptime: process.uptime(), now: Date.now(), lookups: lookups.snapshot() });
 });
 
 app.listen(PORT, '0.0.0.0', () => {

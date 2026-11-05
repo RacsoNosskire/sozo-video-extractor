@@ -23,7 +23,7 @@ const TRACKS = { sub: ['ssub', 'sub'], dub: ['dub'] };
 // icarus is the ultracloud-backed provider the apps were built around.
 const PREFERRED_PROVIDER = 'icarus';
 
-// key: `${anilistId}:${ep}:${type}` -> { url, referer, ts }
+// key: `${anilistId}:${ep}:${type}` -> { url, referer, qualities, subtitles, skips, audio, ts }
 const streamCache = new Map();
 const CACHE_TTL = 20 * 60 * 1000; // 20 min (playlist tokens are short-lived, keep modest)
 
@@ -33,6 +33,26 @@ function getCached(key) {
   streamCache.delete(key);
   return null;
 }
+
+// How the last real episode lookups went, for /health. Only times and one of the words below:
+// nothing about which show, or who asked.
+const LOOKUP_ERRORS = ['source_down', 'timeout', 'error'];
+const lookups = {
+  okAt: null,
+  failAt: null,
+  error: null,
+  note(ok, error = 'error') {
+    if (ok) {
+      this.okAt = Date.now();
+    } else {
+      this.failAt = Date.now();
+      this.error = LOOKUP_ERRORS.includes(error) ? error : 'error';
+    }
+  },
+  snapshot() {
+    return { lastOkAt: this.okAt, lastFailAt: this.failAt, lastError: this.error };
+  },
+};
 
 // Mirrors the site's proxy URL builder: XOR with the hex key, base64url.
 function proxyUrl(base, kind, url, referer, keyHex) {
@@ -90,6 +110,11 @@ function pickCandidates(play, type) {
   return out;
 }
 
+// The versions (TRACKS keys) an episode has an HLS stream for: ['sub', 'dub'], ['sub'], ….
+function audioOf(play) {
+  return Object.keys(TRACKS).filter(type => pickCandidates(play, type).length > 0);
+}
+
 // The provider's intro/outro (seconds) for this episode as [{kind:'op'|'ed', start, end}].
 function skipsOf(p) {
   const out = [];
@@ -108,20 +133,53 @@ async function isPlaylist(url) {
   }
 }
 
+// The first candidate one of the proxies serves a playlist for, or null.
+async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist) {
+  for (const c of candidates) {
+    const upstreamReferer = (c.server.headers && (c.server.headers.Referer || c.server.headers.referer)) || '';
+    for (const base of proxyBases) {
+      const m3u8 = proxyUrl(base, 'pl.m3u8', c.stream.url, upstreamReferer, obfKey);
+      if (!(await check(m3u8))) {
+        console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} via ${base} not playable`);
+        continue;
+      }
+      console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} m3u8 ${m3u8.slice(0, 90)}`);
+
+      const subtitles = c.subtitles
+        .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
+        .sort((a, b) => (b.default === true) - (a.default === true))
+        .map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
+
+      // The proxy itself needs no headers; keep the historical Referer so
+      // clients that always send one behave exactly as before.
+      return { url: m3u8, referer: `${MIRURO_HOST}/`, qualities: [], subtitles, skips: c.skips };
+    }
+  }
+  return null;
+}
+
+const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qualities || [], subtitles: s.subtitles || [], skips: s.skips || [] });
+
 /**
  * Resolve an HLS stream for a given AniList id + episode number.
  * @param {import('puppeteer').Browser} browser shared puppeteer browser
  * @param {string|number} anilistId
  * @param {number} ep 1-based episode number
  * @param {string} type 'sub' | 'dub'
- * @returns {Promise<{videoUrl:string, referer:string, qualities:Array, subtitles:Array}|null>}
+ * @param {{isPlaylist?: (url: string) => Promise<boolean>}} [seams] tests replace the playlist check
+ * @returns {Promise<object|null>} one of
+ *   {videoUrl, referer, qualities, subtitles, skips, audio}: found; audio lists the versions it has;
+ *   {missing: true, audio, fallback}: the episode is there, not in this version; fallback is the
+ *     other version ({type, videoUrl, …}) when one of its streams plays, else null;
+ *   {sourceDown: true}: miruro's catalog, its play call or its proxies didn't answer;
+ *   null: not in the catalog, or no such episode.
  */
-async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
+async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPlaylist: check = isPlaylist } = {}) {
   const key = `${anilistId}:${ep}:${type}`;
   const cached = getCached(key);
   if (cached) {
     console.log(`[MIRURO] cache hit ${key}`);
-    return { videoUrl: cached.url, referer: cached.referer, qualities: cached.qualities || [], subtitles: cached.subtitles || [], skips: cached.skips || [] };
+    return { ...streamOf(cached), audio: cached.audio || [] };
   }
 
   const page = await browser.newPage();
@@ -146,18 +204,23 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
     }
 
     const lookup = await page.evaluate(catalogFetch, `/api/v1/anime?anilist_id_in=${encodeURIComponent(anilistId)}&limit=100`);
-    const entries = (lookup.json && lookup.json.data) || [];
+    if (!lookup.json) {
+      // Cloudflare's challenge page, an HTML error or no connection.
+      console.log(`[MIRURO] catalog lookup failed (${lookup.status} ${lookup.error || ''})`);
+      return { sourceDown: true };
+    }
+    const entries = Array.isArray(lookup.json.data) ? lookup.json.data : [];
     const anime = entries.find(a =>
       ((a.external_ids && a.external_ids.anilist) || []).map(String).includes(String(anilistId)));
     if (!anime) {
-      console.log(`[MIRURO] no catalog entry for anilist ${anilistId} (${lookup.status} ${lookup.error || ''})`);
+      console.log(`[MIRURO] no catalog entry for anilist ${anilistId}`);
       return null;
     }
 
     const play = await page.evaluate(catalogFetch, `/api/v1/anime/${encodeURIComponent(anime.id)}/episodes/${encodeURIComponent(ep)}/play`);
     if (!play.json) {
       console.log(`[MIRURO] play ${anime.id} ep ${ep} failed (${play.status} ${play.error || ''})`);
-      return null;
+      return play.status === 404 ? null : { sourceDown: true };
     }
 
     const env = await page.evaluate(() => window.env || {}).catch(() => ({}));
@@ -167,41 +230,58 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub') {
     const proxyBases = proxies.length ? proxies : DEFAULT_PROXIES;
     const obfKey = env.VITE_PROXY_OBF_KEY || DEFAULT_PROXY_OBF_KEY;
 
-    const candidates = pickCandidates(play.json, type);
-    if (!candidates.length) {
+    const audio = audioOf(play.json);
+    if (!audio.length) {
       const tracks = (play.json.tracks || []).map(t => t.track).join(',');
-      console.log(`[MIRURO] no HLS stream for ${type} (tracks: ${tracks})`);
+      console.log(`[MIRURO] no HLS stream (tracks: ${tracks})`);
       return null;
     }
+    const keep = (t, found) => streamCache.set(`${anilistId}:${ep}:${t}`, { ...found, audio, ts: Date.now() });
 
-    for (const c of candidates) {
-      const upstreamReferer = (c.server.headers && (c.server.headers.Referer || c.server.headers.referer)) || '';
-      for (const base of proxyBases) {
-        const m3u8 = proxyUrl(base, 'pl.m3u8', c.stream.url, upstreamReferer, obfKey);
-        if (!(await isPlaylist(m3u8))) {
-          console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} via ${base} not playable`);
-          continue;
-        }
-        console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} m3u8 ${m3u8.slice(0, 90)}`);
-
-        const subtitles = c.subtitles
-          .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
-          .sort((a, b) => (b.default === true) - (a.default === true))
-          .map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
-
-        // The proxy itself needs no headers; keep the historical Referer so
-        // clients that always send one behave exactly as before.
-        const referer = `${MIRURO_HOST}/`;
-        const result = { url: m3u8, referer, qualities: [], subtitles, skips: c.skips, ts: Date.now() };
-        streamCache.set(key, result);
-        return { videoUrl: m3u8, referer, qualities: [], subtitles, skips: c.skips };
-      }
+    if (!audio.includes(type)) {
+      const other = audio[0];
+      console.log(`[MIRURO] no ${type} for ep ${ep} (has ${audio.join(',')})`);
+      const found = await firstPlayable(pickCandidates(play.json, other), proxyBases, obfKey, check);
+      if (found) keep(other, found);
+      return { missing: true, audio, fallback: found ? { type: other, ...streamOf(found) } : null };
     }
-    console.log('[MIRURO] no candidate stream served a playlist');
-    return null;
+
+    const found = await firstPlayable(pickCandidates(play.json, type), proxyBases, obfKey, check);
+    if (!found) {
+      console.log('[MIRURO] no candidate stream served a playlist');
+      return { sourceDown: true };
+    }
+    keep(type, found);
+    return { ...streamOf(found), audio };
   } finally {
     await page.close().catch(() => {});
   }
 }
 
-module.exports = { resolveMiruroStream };
+// The HTTP answer to /miruro/stream for a resolveMiruroStream result, and whether it counts as a
+// lookup that worked (`ok`, else `error` says how it failed) in `lookups`.
+function streamAnswer(result, type) {
+  if (result && result.videoUrl) {
+    const body = {
+      status: 'ok',
+      videoUrl: result.videoUrl,
+      referer: result.referer,
+      qualities: result.qualities || [],
+      subtitles: result.subtitles || [],
+      // Intro/outro of this exact video, seconds: [{kind:'op'|'ed', start, end}].
+      skips: result.skips || [],
+      audio: result.audio || [],
+    };
+    return { status: 200, ok: true, body };
+  }
+  if (result && result.missing) {
+    const error = type === 'dub' ? 'No dub for this episode' : 'No subtitled version of this episode';
+    return { status: 404, ok: true, body: { status: 'error', error, reason: 'no_track', audio: result.audio, fallback: result.fallback } };
+  }
+  if (result && result.sourceDown) {
+    return { status: 502, ok: false, error: 'source_down', body: { status: 'error', error: 'The stream source is not answering', reason: 'source_down' } };
+  }
+  return { status: 404, ok: true, body: { status: 'error', error: 'No stream found', reason: 'not_found' } };
+}
+
+module.exports = { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, lookups };

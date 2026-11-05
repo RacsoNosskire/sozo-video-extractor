@@ -9,7 +9,7 @@ from this repo's `main` (see "Deploying").
 | `GET /miruro/stream?anilistId=&ep=&type=sub\|dub` | Resolves one episode on miruro.tv (`miruro.js`) |
 | `GET /proxy/m3u8\|seg\|sub` | HLS proxy for the browser build (`proxy.js`) |
 | `GET /auth/pair`, `/auth/login`, `POST /auth/complete`, `GET /auth/poll` | TV sign-in through a phone (`pairing.js`) |
-| `GET /health` | Liveness |
+| `GET /health` | Liveness, and how the last episode lookups went (`Cache-Control: no-store`) |
 | `/animepahe/*` | Old source, unused by AniZiQ |
 
 ## Run and test
@@ -25,6 +25,35 @@ Environment:
 |---|---|---|
 | `PORT` | `3232` | Listening port |
 | `TRUSTED_PROXIES` | unset (trust none) | Comma-separated addresses or CIDR ranges whose `X-Real-IP` names the real client (the site's nginx). From anyone else the header is ignored and the rate limits key on the socket's address, so a LAN client can't dodge them by rotating it. An ignored header is logged once per address: `[TRUST] X-Real-IP from 172.18.0.1 ignored (not in TRUSTED_PROXIES)`. |
+
+## `/miruro/stream`
+
+`type=sub` (the default) or `type=dub`. Older clients read only the 200 and treat everything else
+as "no stream", so the extra fields are safe for them.
+
+| Status | Body | When |
+|---|---|---|
+| 200 | `{status:"ok", videoUrl, referer, qualities, subtitles, skips, audio}` | Found. `audio` lists the versions the episode has: `["sub","dub"]`, `["sub"]`. |
+| 404 | `{status:"error", error:"No dub for this episode", reason:"no_track", audio, fallback}` | The episode is there, but not in that version (or "No subtitled version of this episode"). `fallback` is the other version, `{type, videoUrl, referer, qualities, subtitles, skips}`, ready to play, or null. |
+| 404 | `{status:"error", error:"No stream found", reason:"not_found"}` | Not in miruro's catalogue, no such episode, or no HLS stream at all. |
+| 502 | `{status:"error", error:"The stream source is not answering", reason:"source_down"}` | miruro's catalogue (Cloudflare, HTML, no connection), its play call or every proxy failed. |
+| 504 | `{status:"error", error:"Extractor timeout", reason:"timeout"}` | No answer within 70 s. |
+| 500 | `{status:"error", error:<message>}` | Anything else. |
+
+Results are cached for 20 minutes per episode and version; the fallback is cached under its own
+version, so asking for it next costs nothing.
+
+## `/health`
+
+```
+{"status":"ok","uptime":3.15,"now":1793906454024,"lookups":{"lastOkAt":null,"lastFailAt":null,"lastError":null}}
+```
+
+`lookups` records the last episode lookup that worked (a 200 or a 404 counts: the source answered)
+and the last one that failed, as this server's `Date.now()` times, with `lastError` one of
+`source_down`, `timeout` or `error`. A lookup that finishes after its 504 is still recorded. Nothing
+else is kept: no show, no client. The apps compute ages against `now`, so clock differences don't
+matter.
 
 ## Local test helpers (`dev/`)
 

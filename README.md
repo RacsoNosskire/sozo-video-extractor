@@ -117,7 +117,7 @@ These two are the shared wire fixture: `sync.test.js` holds them in full (`REQUE
 | 413 | `too large`, `too many changes` | Body over 1 MB, or more than 500 changes |
 | 429 | `Too many requests` | More than 60 requests a minute from one client (`TRUSTED_PROXIES`) |
 | 500 | `storage unavailable`, `write failed` | `SYNC_DIR` can't be used, or the write failed |
-| 503 | `AniList is unreachable`, `AniList is busy`, … | AniList didn't answer (or with a 429 or 5xx), or more than 20 uncached sign-in checks this minute. `Retry-After: 30` |
+| 503 | `AniList is unreachable`, `AniList is busy`, … | AniList didn't answer (or with a 429 or 5xx), or this minute's uncached sign-in checks are used up (below). `Retry-After: 30` |
 
 An older server answers 404: the apps then say it doesn't sync yet.
 
@@ -125,9 +125,15 @@ How a sign-in is checked: the header must be `Bearer ` plus 20–4096 characters
 `[A-Za-z0-9._~+/=-]`; then AniList is asked `query { Viewer { id } }` (10 s limit). The answer is
 kept by the token's SHA-256 for 10 minutes (a refusal for 1), concurrent checks of one token share a
 call, and at most 20 checks a minute that the cache can't answer go to AniList, for all clients
-together. The token itself is never stored, logged or written; a revoked token keeps working here
-for up to 10 minutes. While sign-ins go to AniList itself, tokens starting `fake-` (the test tokens)
-are refused without asking it.
+together. Of those, tokens AniList hasn't vouched for here get 15, and each account it has vouched
+for gets 2 re-checks a minute (with `SYNC_USERS` set, only those accounts), so a flood of made-up
+tokens can't keep the household's devices from being checked again when their 10 minutes are up.
+Which tokens it vouched for is kept by hash as well, apart from the cache (the last 1000; a refusal
+forgets one). While checks are refused for the budget, the log says so once a minute:
+`[SYNC] AniList sign-in checks over budget (15 this minute for tokens it hasn't vouched for): answering 503`.
+The token itself is never stored, logged or written; a revoked token keeps working here for up to
+10 minutes. While sign-ins go to AniList itself, tokens starting `fake-` (the test tokens) are
+refused without asking it.
 
 Storage: one file per account, `SYNC_DIR/<id>.json` (`{"v":1,"user":…,"epoch":…,"rev":…,"updatedAt":…,
 "history":{"21":{"at":…,"rev":…,"data":{…}}},"saved":{…},"hidden":{…}}`). Requests for one account run

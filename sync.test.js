@@ -231,7 +231,7 @@ test('viewerLookup: one AniList call per token, kept by hash, failures not kept'
     assert.ok(!JSON.stringify([...lookup.cache]).includes('tok-'));
 });
 
-test('viewerLookup: at most 20 AniList calls a minute for unknown tokens; test tokens never go to AniList', async () => {
+test('viewerLookup: at most 15 AniList calls a minute for unknown tokens; test tokens never go to AniList', async () => {
     let t = 0;
     let calls = 0;
     const fetchImpl = async () => {
@@ -239,16 +239,94 @@ test('viewerLookup: at most 20 AniList calls a minute for unknown tokens; test t
         return new Response(JSON.stringify({ errors: [{ message: 'Invalid token' }] }), { status: 400 });
     };
     const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl, now: () => t });
-    for (let i = 0; i < 20; i++) await assert.rejects(lookup.idFor(`random-token-${i}-0000000000`), { status: 401 });
-    await assert.rejects(lookup.idFor('random-token-20-0000000000'), { status: 503 });
+    for (let i = 0; i < 15; i++) await assert.rejects(lookup.idFor(`random-token-${i}-0000000000`), { status: 401 });
+    await assert.rejects(lookup.idFor('random-token-15-0000000000'), { status: 503 });
     await assert.rejects(lookup.idFor('random-token-3-0000000000'), { status: 401 }); // cached refusals still answer
-    assert.equal(calls, 20);
+    assert.equal(calls, 15);
     t += 60_000;
-    await assert.rejects(lookup.idFor('random-token-21-0000000000'), { status: 401 });
-    assert.equal(calls, 21);
+    await assert.rejects(lookup.idFor('random-token-16-0000000000'), { status: 401 });
+    assert.equal(calls, 16);
 
     const real = viewerLookup({ fetchImpl: async () => assert.fail('a fake- token was sent to AniList') });
     await assert.rejects(real.idFor('fake-tester-pc-0000001'), { status: 401 });
+});
+
+// AniList as viewerLookup asks it: `accountOf(token)` is the account, 0 a refusal. Counts calls.
+function anilistFor(accountOf) {
+    const anilist = { calls: 0 };
+    anilist.fetchImpl = async (url, init) => {
+        anilist.calls += 1;
+        const id = accountOf(init.headers.Authorization.replace(/^Bearer /, ''));
+        if (!id) return new Response(JSON.stringify({ errors: [{ message: 'Invalid token', status: 400 }], data: null }), { status: 400 });
+        return new Response(JSON.stringify({ data: { Viewer: { id } } }), { status: 200 });
+    };
+    return anilist;
+}
+const junk = (i) => `made-up-token-${String(i).padStart(10, '0')}`;
+
+test('viewerLookup: made-up tokens get 15 checks a minute, so an account AniList vouched for is still checked', async (t) => {
+    const log = t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const anilist = anilistFor((token) => ({ [TOK_A]: 1001, [TOK_C]: 3003 })[token] || 0);
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    now += 10 * 60_000 + 1_000; // its id has left the cache
+    const flood = [];
+    for (let i = 0; i < 20; i++) flood.push(await lookup.idFor(junk(i)).catch((e) => e.status));
+    assert.deepEqual(flood, [...Array(15).fill(401), ...Array(5).fill(503)]);
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    await assert.rejects(lookup.idFor(TOK_C), { status: 503 }); // a token never seen waits for the flood to end
+    assert.equal(anilist.calls, 17);
+    const busy = "[SYNC] AniList sign-in checks over budget (15 this minute for tokens it hasn't vouched for): answering 503";
+    assert.deepEqual(log.mock.calls.map((c) => c.arguments[0]), [busy]);
+    now += 60_000; // the flood goes on, and the log says so once a minute
+    for (let i = 20; i < 40; i++) await lookup.idFor(junk(i)).catch(() => {});
+    assert.deepEqual(log.mock.calls.map((c) => c.arguments[0]), [busy, busy]);
+});
+
+test("viewerLookup: one account's tokens get 2 re-checks a minute, so many of them can't keep another account out", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const own = (i) => `own-token-${String(i).padStart(14, '0')}`;
+    const anilist = anilistFor((token) => (token === TOK_A ? 1001 : token.startsWith('own-token-') ? 2002 : 0));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    for (let i = 0; i < 60; i++) {
+        if (i && i % 12 === 0) now += 60_000; // 12 a minute fit the share for tokens not vouched for yet
+        assert.equal(await lookup.idFor(own(i)), 2002);
+    }
+    now = NOW + 15 * 60_000; // every id has left the cache
+    const again = [];
+    for (let i = 0; i < 60; i++) again.push(await lookup.idFor(own(i)).catch((e) => e.status));
+    assert.deepEqual(again, [2002, 2002, ...Array(58).fill(503)]);
+    for (let i = 0; i < 15; i++) await assert.rejects(lookup.idFor(junk(i)), { status: 401 });
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    assert.equal(anilist.calls, 1 + 60 + 2 + 15 + 1);
+});
+
+test('viewerLookup: what AniList vouched for is kept by hash, outlives cache.clear, goes on a refusal and follows SYNC_USERS', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const revoked = new Set();
+    const anilist = anilistFor((token) => (revoked.has(token) ? 0 : ({ [TOK_A]: 1001, [TOK_B]: 1001, [TOK_C]: 3003 })[token] || 0));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now, allow: new Set([1001]) });
+    assert.deepEqual([await lookup.idFor(TOK_A), await lookup.idFor(TOK_B), await lookup.idFor(TOK_C)], [1001, 1001, 3003]);
+    assert.deepEqual([...lookup.known.values()], [1001, 1001]); // 3003 isn't in SYNC_USERS
+    for (const key of lookup.known.keys()) assert.match(key, /^[0-9a-f]{64}$/);
+    assert.ok(!JSON.stringify([...lookup.known]).includes('tok-'));
+
+    revoked.add(TOK_B);
+    now += 60_000;
+    lookup.cache.clear(); // as at 1000 entries
+    for (let i = 0; i < 15; i++) await assert.rejects(lookup.idFor(junk(i)), { status: 401 });
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    await assert.rejects(lookup.idFor(TOK_B), { status: 401 });
+    await assert.rejects(lookup.idFor(TOK_C), { status: 503 }); // in with the made-up tokens
+    assert.equal(lookup.known.size, 1);
+
+    now += 61_000; // TOK_B's refusal has left the cache, and it is a token like any other now
+    for (let i = 15; i < 30; i++) await assert.rejects(lookup.idFor(junk(i)), { status: 401 });
+    await assert.rejects(lookup.idFor(TOK_B), { status: 503 });
 });
 
 test('ANILIST_URL: AniList itself or a loopback stand-in, nothing else', () => {

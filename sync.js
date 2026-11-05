@@ -24,6 +24,8 @@ const LIMITS = {
     stored: 3000, // entries per kind and account
     perMinute: 60, // requests per client
     lookupsPerMinute: 20, // AniList viewer lookups not answered from the cache, all clients together
+    unknownPerMinute: 15, // of those, for tokens AniList hasn't vouched for here
+    recheckPerMinute: 2, // of those, for the tokens of one account it has vouched for
     users: 50, // account files (SYNC_MAX_USERS)
     tombstoneDays: 365,
     aheadMs: 5 * 60 * 1000, // how far past the server's clock an `at` may be
@@ -182,24 +184,46 @@ function anilistUrl(value) {
 // Who a token belongs to, asked of AniList and cached by the token's SHA-256. Throws HttpError
 // 401 when AniList refuses the token and 503 when it can't answer (not cached). At most
 // LIMITS.lookupsPerMinute questions a minute go to AniList, so random tokens can't get this
-// server rate-limited there.
-function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now } = {}) {
+// server rate-limited there. Of those, tokens AniList hasn't vouched for get
+// LIMITS.unknownPerMinute and each account it has vouched for (one in `allow`, when that is set)
+// LIMITS.recheckPerMinute, so a flood of made-up tokens can't keep the accounts that sync here
+// from being checked again.
+function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow = null } = {}) {
     const cache = new Map(); // sha256 hex → { id (0 = refused), until }
+    const known = new Map(); // sha256 hex → id, the tokens AniList vouched for, oldest first
     const inFlight = new Map();
-    const asked = []; // times of the questions in the last minute
+    const asked = []; // { t, account } of the questions in the last minute; 0 for a token not vouched for
     const toAniList = url.replace(/\/+$/, '') === ANILIST;
     const refused = () => new HttpError(401, 'sign-in refused');
+    let busyLoggedAt = -Infinity;
 
     const remember = (key, id, ms) => {
         if (cache.size >= 1000) cache.clear();
         cache.set(key, { id, until: now() + ms });
     };
 
+    // Throws 503 when this minute's checks are used up, or the share of them for `account` (0:
+    // tokens not vouched for); the log says so once a minute.
+    function budget(t, account) {
+        while (asked.length && t - asked[0].t >= 60_000) asked.shift();
+        const same = asked.filter((a) => a.account === account).length;
+        let full = '';
+        if (asked.length >= LIMITS.lookupsPerMinute) full = `${asked.length} this minute`;
+        else if (!account && same >= LIMITS.unknownPerMinute) full = `${same} this minute for tokens it hasn't vouched for`;
+        else if (account && same >= LIMITS.recheckPerMinute) full = `${same} re-checks this minute for account ${account}`;
+        if (!full) return;
+        if (t - busyLoggedAt >= 60_000) {
+            busyLoggedAt = t;
+            console.error(`[SYNC] AniList sign-in checks over budget (${full}): answering 503`);
+        }
+        throw new HttpError(503, 'AniList is busy');
+    }
+
     async function ask(token, key) {
         const t = now();
-        while (asked.length && t - asked[0] >= 60_000) asked.shift();
-        if (asked.length >= LIMITS.lookupsPerMinute) throw new HttpError(503, 'AniList is busy');
-        asked.push(t);
+        const account = known.get(key) || 0;
+        budget(t, account);
+        asked.push({ t, account });
         let res;
         let body;
         try {
@@ -220,11 +244,18 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now } = {})
         const message = json && Array.isArray(json.errors) && json.errors[0] ? json.errors[0].message : '';
         // AniList answers a bad token with HTTP 400 "Invalid token".
         if (res.status === 401 || (typeof message === 'string' && /invalid token/i.test(message))) {
+            known.delete(key);
             remember(key, 0, 60_000);
             throw refused();
         }
         const id = json && json.data && json.data.Viewer ? json.data.Viewer.id : null;
         if (res.status === 200 && isInt(id, 1, MAX_ID)) {
+            // Kept apart from the cache (newest last), so the token's next check has its account's share.
+            known.delete(key);
+            if (!allow || allow.has(id)) {
+                if (known.size >= 1000) known.delete(known.keys().next().value);
+                known.set(key, id);
+            }
             remember(key, id, 10 * 60_000);
             return id;
         }
@@ -233,6 +264,7 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now } = {})
 
     return {
         cache,
+        known,
         async idFor(token) {
             const key = crypto.createHash('sha256').update(token).digest('hex');
             const hit = cache.get(key);
@@ -302,7 +334,7 @@ function mount(app, opts = {}) {
     const allow = allowList(opts.allow ?? process.env.SYNC_USERS);
     const envMax = Number(process.env.SYNC_MAX_USERS);
     const maxUsers = opts.maxUsers ?? (isInt(envMax, 1, 1_000_000) ? envMax : LIMITS.users);
-    const viewers = viewerLookup({ url: anilistUrl(opts.anilistUrl ?? process.env.ANILIST_URL), fetchImpl: opts.fetchImpl, now });
+    const viewers = viewerLookup({ url: anilistUrl(opts.anilistUrl ?? process.env.ANILIST_URL), fetchImpl: opts.fetchImpl, now, allow });
 
     let ready = false;
     try {

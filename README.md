@@ -137,14 +137,19 @@ How a sign-in is checked: the header must be `Bearer ` plus 20–4096 characters
 kept by the token's SHA-256 for 10 minutes (a refusal for 1), concurrent checks of one token share a
 call, and at most 20 checks a minute that the cache can't answer go to AniList, for all clients
 together. Of those, tokens AniList hasn't vouched for here get 15, and each account it has vouched
-for gets 2 re-checks a minute (with `SYNC_USERS` set, only those accounts), so a flood of made-up
-tokens can't keep the household's devices from being checked again when their 10 minutes are up.
-Which tokens it vouched for is kept by hash as well, apart from the cache (the last 1000; a refusal
-forgets one). While checks are refused for the budget, the log says so once a minute:
+for gets 2 re-checks a minute. Which tokens it vouched for, and when it last did, is kept by hash as
+well, apart from the cache (the last 1000; a refusal forgets one). A re-check that finds no room
+(this minute's 20 or its account's 2 used up) keeps the id AniList gave, without asking it, until an
+hour after AniList last vouched for that token; after that it gets 503 until there is room. So three
+devices of one account re-checked in the same minute all go through, and made-up tokens can't keep
+the household's devices out; other people's real tokens could, but only by using up every minute's
+checks for over an hour. What `SYNC_USERS` adds: only the accounts it names count as vouched for,
+so anyone else's tokens share the 15 with the made-up ones and can't use up the household's checks
+at all. While checks are refused for the budget, the log says so once a minute:
 `[SYNC] AniList sign-in checks over budget (15 this minute for tokens it hasn't vouched for): answering 503`.
 The token itself is never stored, logged or written; a revoked token keeps working here for up to
-10 minutes. While sign-ins go to AniList itself, tokens starting `fake-` (the test tokens) are
-refused without asking it.
+10 minutes, and up to an hour while there is no room to check it again. While sign-ins go to
+AniList itself, tokens starting `fake-` (the test tokens) are refused without asking it.
 
 Storage: one file per account, `SYNC_DIR/<id>.json` (`{"v":1,"user":…,"epoch":…,"rev":…,"updatedAt":…,
 "history":{"21":{"at":…,"rev":…,"data":{…}}},"saved":{…},"hidden":{…}}`). Requests for one account run

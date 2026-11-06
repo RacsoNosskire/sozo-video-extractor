@@ -26,6 +26,7 @@ const LIMITS = {
     lookupsPerMinute: 20, // AniList viewer lookups not answered from the cache, all clients together
     unknownPerMinute: 15, // of those, for tokens AniList hasn't vouched for here
     recheckPerMinute: 2, // of those, for the tokens of one account it has vouched for
+    vouchedMs: 60 * 60 * 1000, // with no room left, how long a token's id stands after AniList last vouched for it
     users: 50, // account files (SYNC_MAX_USERS)
     tombstoneDays: 365,
     aheadMs: 5 * 60 * 1000, // how far past the server's clock an `at` may be
@@ -196,11 +197,12 @@ function anilistUrl(value) {
 // LIMITS.lookupsPerMinute questions a minute go to AniList, so random tokens can't get this
 // server rate-limited there. Of those, tokens AniList hasn't vouched for get
 // LIMITS.unknownPerMinute and each account it has vouched for (one in `allow`, when that is set)
-// LIMITS.recheckPerMinute, so a flood of made-up tokens can't keep the accounts that sync here
-// from being checked again.
+// LIMITS.recheckPerMinute. A token it vouched for that finds no room keeps that id, without a
+// call, until LIMITS.vouchedMs after AniList last did so: made-up tokens can't keep the accounts
+// that sync here out, and other accounts' re-checks only by using up every check for that long.
 function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow = null } = {}) {
     const cache = new Map(); // sha256 hex → { id (0 = refused), until }
-    const known = new Map(); // sha256 hex → id, the tokens AniList vouched for, oldest first
+    const known = new Map(); // sha256 hex → { id, at }, the tokens AniList vouched for (at: when it last did), oldest first
     const inFlight = new Map();
     const asked = []; // { t, account } of the questions in the last minute; 0 for a token not vouched for
     const toAniList = url.replace(/\/+$/, '') === ANILIST;
@@ -212,27 +214,32 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
         cache.set(key, { id, until: now() + ms });
     };
 
-    // Throws 503 when this minute's checks are used up, or the share of them for `account` (0:
-    // tokens not vouched for); the log says so once a minute.
-    function budget(t, account) {
+    // Why this minute's checks have no room for one for `account` (0: tokens not vouched for), or
+    // '' when they have.
+    function overBudget(t, account) {
         while (asked.length && t - asked[0].t >= 60_000) asked.shift();
         const same = asked.filter((a) => a.account === account).length;
-        let full = '';
-        if (asked.length >= LIMITS.lookupsPerMinute) full = `${asked.length} this minute`;
-        else if (!account && same >= LIMITS.unknownPerMinute) full = `${same} this minute for tokens it hasn't vouched for`;
-        else if (account && same >= LIMITS.recheckPerMinute) full = `${same} re-checks this minute for account ${account}`;
-        if (!full) return;
-        if (t - busyLoggedAt >= 60_000) {
-            busyLoggedAt = t;
-            console.error(`[SYNC] AniList sign-in checks over budget (${full}): answering 503`);
-        }
-        throw new HttpError(503, 'AniList is busy');
+        if (asked.length >= LIMITS.lookupsPerMinute) return `${asked.length} this minute`;
+        if (!account && same >= LIMITS.unknownPerMinute) return `${same} this minute for tokens it hasn't vouched for`;
+        if (account && same >= LIMITS.recheckPerMinute) return `${same} re-checks this minute for account ${account}`;
+        return '';
     }
 
     async function ask(token, key) {
         const t = now();
-        const account = known.get(key) || 0;
-        budget(t, account);
+        const vouched = known.get(key);
+        const account = vouched ? vouched.id : 0;
+        const full = overBudget(t, account);
+        if (full) {
+            // What AniList said of the token in the last hour stands, without a call. Anything else
+            // is a 503, and the log says so once a minute.
+            if (vouched && t - vouched.at < LIMITS.vouchedMs) return vouched.id;
+            if (t - busyLoggedAt >= 60_000) {
+                busyLoggedAt = t;
+                console.error(`[SYNC] AniList sign-in checks over budget (${full}): answering 503`);
+            }
+            throw new HttpError(503, 'AniList is busy');
+        }
         asked.push({ t, account });
         let res;
         let body;
@@ -264,7 +271,7 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
             known.delete(key);
             if (!allow || allow.has(id)) {
                 if (known.size >= 1000) known.delete(known.keys().next().value);
-                known.set(key, id);
+                known.set(key, { id, at: now() });
             }
             remember(key, id, 10 * 60_000);
             return id;

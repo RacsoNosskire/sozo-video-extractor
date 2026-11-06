@@ -270,6 +270,20 @@ function anilistFor(accountOf) {
     return anilist;
 }
 const junk = (i) => `made-up-token-${String(i).padStart(10, '0')}`;
+// Someone else's real sign-ins: token `i` of account 7000 + `k`; rivals(accounts, n) is set `n` of
+// them, two tokens each of accounts 7001 to 7000 + `accounts`.
+const rival = (k, i) => `rival-${k}-token-${String(i).padStart(10, '0')}`;
+const rivalAccount = (token) => (token.startsWith('rival-') ? 7000 + Number(token.split('-')[1]) : 0);
+const rivals = (accounts, n = 0) => Array.from({ length: accounts }, (_, k) => [rival(k + 1, 2 * n), rival(k + 1, 2 * n + 1)]).flat();
+
+// Spends this minute's 20 checks as someone holding `tokens` (2 per account, their ids run out)
+// could: their re-checks, then 20 made-up tokens from junk(from). Returns what the made-up ones got.
+async function spendMinute(lookup, tokens, from = 0) {
+    for (const token of tokens) assert.equal(await lookup.idFor(token), rivalAccount(token));
+    const flood = [];
+    for (let i = from; i < from + 20; i++) flood.push(await lookup.idFor(junk(i)).catch((e) => e.status));
+    return flood;
+}
 
 test('viewerLookup: made-up tokens get 15 checks a minute, so an account AniList vouched for is still checked', async (t) => {
     const log = t.mock.method(console, 'error', () => {});
@@ -302,13 +316,72 @@ test("viewerLookup: one account's tokens get 2 re-checks a minute, so many of th
         if (i && i % 12 === 0) now += 60_000; // 12 a minute fit the share for tokens not vouched for yet
         assert.equal(await lookup.idFor(own(i)), 2002);
     }
+    const recheck = async () => {
+        const out = [];
+        for (let i = 0; i < 60; i++) out.push(await lookup.idFor(own(i)).catch((e) => e.status));
+        return out;
+    };
     now = NOW + 15 * 60_000; // every id has left the cache
-    const again = [];
-    for (let i = 0; i < 60; i++) again.push(await lookup.idFor(own(i)).catch((e) => e.status));
-    assert.deepEqual(again, [2002, 2002, ...Array(58).fill(503)]);
+    assert.deepEqual(await recheck(), Array(60).fill(2002)); // 2 ask AniList; the rest keep what it said, unasked
     for (let i = 0; i < 15; i++) await assert.rejects(lookup.idFor(junk(i)), { status: 401 });
     assert.equal(await lookup.idFor(TOK_A), 1001);
     assert.equal(anilist.calls, 1 + 60 + 2 + 15 + 1);
+    now = NOW + 75 * 60_000; // over an hour since AniList vouched for the 58 it wasn't asked about again
+    assert.deepEqual(await recheck(), [2002, 2002, ...Array(58).fill(503)]);
+    assert.equal(anilist.calls, 1 + 60 + 2 + 15 + 1 + 2);
+});
+
+test('viewerLookup: three devices of one account re-checked in the same minute all keep their id', async (t) => {
+    const log = t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const devices = [TOK_A, TOK_B, 'tok-tv-00000000000000000']; // the PC, the site and the TV
+    const anilist = anilistFor((token) => (devices.includes(token) ? 1001 : 0));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+    for (const [i, token] of devices.entries()) {
+        now = NOW + i * 10_000;
+        assert.equal(await lookup.idFor(token), 1001);
+    }
+    const again = [];
+    for (const [i, token] of devices.entries()) {
+        now = NOW + 10 * 60_000 + 1_000 + i * 10_000; // each one's next exchange after its id ran out
+        again.push(await lookup.idFor(token).catch((e) => e.status));
+    }
+    assert.deepEqual(again, [1001, 1001, 1001]);
+    assert.equal(anilist.calls, 3 + 2); // the account's 2 re-checks; the TV keeps what AniList said 10 minutes before
+    assert.deepEqual(log.mock.calls, []); // nothing was refused
+});
+
+test("viewerLookup: real tokens of 3 or 4 other accounts and made-up ones can't turn the household's re-check into a 503", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    for (const accounts of [3, 4]) {
+        let now = NOW;
+        const anilist = anilistFor((token) => (token === TOK_A ? 1001 : rivalAccount(token)));
+        const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+        const theirs = rivals(accounts);
+        for (const token of [TOK_A, ...theirs]) assert.ok(await lookup.idFor(token));
+        now += 10 * 60_000 + 1_000; // every id has run out
+        const calls = anilist.calls;
+        const flood = await spendMinute(lookup, theirs);
+        assert.deepEqual(flood, [...Array(20 - theirs.length).fill(401), ...Array(theirs.length).fill(503)]);
+        assert.equal(await lookup.idFor(TOK_A), 1001, `${accounts} accounts`); // what AniList said 10 minutes before
+        assert.equal(anilist.calls - calls, 20);
+    }
+});
+
+test('viewerLookup: with no room for a check, an id stands until an hour after AniList last vouched for the token', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const anilist = anilistFor((token) => (token === TOK_A ? 1001 : rivalAccount(token)));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+    for (const token of [TOK_A, ...rivals(3, 0), ...rivals(3, 1)]) assert.ok(await lookup.idFor(token));
+    now = NOW + 59 * 60_000;
+    assert.deepEqual(await spendMinute(lookup, rivals(3, 0)), [...Array(14).fill(401), ...Array(6).fill(503)]);
+    const calls = anilist.calls;
+    assert.equal(await lookup.idFor(TOK_A), 1001); // vouched for 59 minutes ago
+    now = NOW + 60 * 60_000 + 1_000;
+    assert.deepEqual(await spendMinute(lookup, rivals(3, 1), 20), [...Array(14).fill(401), ...Array(6).fill(503)]);
+    await assert.rejects(lookup.idFor(TOK_A), { status: 503 }); // 60 minutes and 1 s: the answer at 59 didn't renew it
+    assert.equal(anilist.calls, calls + 20);
 });
 
 test('viewerLookup: what AniList vouched for is kept by hash, outlives cache.clear, goes on a refusal and follows SYNC_USERS', async (t) => {
@@ -318,7 +391,7 @@ test('viewerLookup: what AniList vouched for is kept by hash, outlives cache.cle
     const anilist = anilistFor((token) => (revoked.has(token) ? 0 : ({ [TOK_A]: 1001, [TOK_B]: 1001, [TOK_C]: 3003 })[token] || 0));
     const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now, allow: new Set([1001]) });
     assert.deepEqual([await lookup.idFor(TOK_A), await lookup.idFor(TOK_B), await lookup.idFor(TOK_C)], [1001, 1001, 3003]);
-    assert.deepEqual([...lookup.known.values()], [1001, 1001]); // 3003 isn't in SYNC_USERS
+    assert.deepEqual([...lookup.known.values()], [{ id: 1001, at: NOW }, { id: 1001, at: NOW }]); // 3003 isn't in SYNC_USERS
     for (const key of lookup.known.keys()) assert.match(key, /^[0-9a-f]{64}$/);
     assert.ok(!JSON.stringify([...lookup.known]).includes('tok-'));
 
@@ -334,6 +407,22 @@ test('viewerLookup: what AniList vouched for is kept by hash, outlives cache.cle
     now += 61_000; // TOK_B's refusal has left the cache, and it is a token like any other now
     for (let i = 15; i < 30; i++) await assert.rejects(lookup.idFor(junk(i)), { status: 401 });
     await assert.rejects(lookup.idFor(TOK_B), { status: 503 });
+});
+
+test('viewerLookup: a token AniList refused is forgotten, so with no room for a check it gets no id', async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    const revoked = new Set();
+    const anilist = anilistFor((token) => (revoked.has(token) ? 0 : token === TOK_A || token === TOK_B ? 1001 : rivalAccount(token)));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl: anilist.fetchImpl, now: () => now });
+    for (const token of [TOK_A, TOK_B, ...rivals(3)]) assert.ok(await lookup.idFor(token));
+    revoked.add(TOK_B); // signed out on AniList
+    now += 10 * 60_000 + 1_000;
+    await assert.rejects(lookup.idFor(TOK_B), { status: 401 }); // there was room to ask
+    now += 61_000; // the refusal has left the cache
+    assert.deepEqual(await spendMinute(lookup, rivals(3)), [...Array(14).fill(401), ...Array(6).fill(503)]);
+    await assert.rejects(lookup.idFor(TOK_B), { status: 503 }); // in with the made-up tokens
+    assert.equal(await lookup.idFor(TOK_A), 1001); // vouched for 11 minutes ago and never refused
 });
 
 test('ANILIST_URL: AniList itself or a loopback stand-in, nothing else', () => {

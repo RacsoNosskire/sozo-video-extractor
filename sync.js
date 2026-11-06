@@ -208,6 +208,11 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
     const toAniList = url.replace(/\/+$/, '') === ANILIST;
     const refused = () => new HttpError(401, 'sign-in refused');
     let busyLoggedAt = -Infinity;
+    let troubleAt = -Infinity; // when AniList last failed to answer
+    const trouble = (message) => {
+        troubleAt = now();
+        return new HttpError(503, message);
+    };
 
     const remember = (key, id, ms) => {
         if (cache.size >= 1000) cache.clear();
@@ -231,9 +236,10 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
         const account = vouched ? vouched.id : 0;
         const full = overBudget(t, account);
         if (full) {
-            // What AniList said of the token in the last hour stands, without a call. Anything else
-            // is a 503, and the log says so once a minute.
-            if (vouched && t - vouched.at < LIMITS.vouchedMs) return vouched.id;
+            // What AniList said of the token in the last hour stands, without a call, unless AniList
+            // itself failed this past minute (then a revoked token could pass). Anything else is a
+            // 503, and the log says so once a minute.
+            if (vouched && t - vouched.at < LIMITS.vouchedMs && t - troubleAt >= 60_000) return vouched.id;
             if (t - busyLoggedAt >= 60_000) {
                 busyLoggedAt = t;
                 console.error(`[SYNC] AniList sign-in checks over budget (${full}): answering 503`);
@@ -252,7 +258,7 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
             });
             body = await res.text();
         } catch {
-            throw new HttpError(503, 'AniList is unreachable');
+            throw trouble('AniList is unreachable');
         }
         let json = null;
         try {
@@ -276,7 +282,7 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
             remember(key, id, 10 * 60_000);
             return id;
         }
-        throw new HttpError(503, `AniList answered HTTP ${res.status}`);
+        throw trouble(`AniList answered HTTP ${res.status}`);
     }
 
     return {

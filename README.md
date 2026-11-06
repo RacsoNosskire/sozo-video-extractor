@@ -140,7 +140,9 @@ together. Of those, tokens AniList hasn't vouched for here get 15, and each acco
 for gets 2 re-checks a minute. Which tokens it vouched for, and when it last did, is kept by hash as
 well, apart from the cache (the last 1000; a refusal forgets one). A re-check that finds no room
 (this minute's 20 or its account's 2 used up) keeps the id AniList gave, without asking it, until an
-hour after AniList last vouched for that token; after that it gets 503 until there is room. So three
+hour after AniList last vouched for that token; after that it gets 503 until there is room. That
+doesn't apply while AniList itself fails (unreachable, or any answer but an id or a refusal, in the
+past minute): then every check that finds no room gets 503, so a revoked token can't pass. So three
 devices of one account re-checked in the same minute all go through, and made-up tokens can't keep
 the household's devices out; other people's real tokens could, but only by using up every minute's
 checks for over an hour. What `SYNC_USERS` adds: only the accounts it names count as vouched for,

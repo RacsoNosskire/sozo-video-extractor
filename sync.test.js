@@ -425,6 +425,24 @@ test('viewerLookup: a token AniList refused is forgotten, so with no room for a 
     assert.equal(await lookup.idFor(TOK_A), 1001); // vouched for 11 minutes ago and never refused
 });
 
+test("viewerLookup: while AniList fails, a token it vouched for isn't answered from memory", async (t) => {
+    t.mock.method(console, 'error', () => {});
+    let now = NOW;
+    let failing = false;
+    const anilist = anilistFor((token) => (token === TOK_A ? 1001 : 0));
+    const fetchImpl = (url, init) => (failing ? Promise.resolve(new Response('slow down', { status: 429 })) : anilist.fetchImpl(url, init));
+    const lookup = viewerLookup({ url: 'http://127.0.0.1:9/', fetchImpl, now: () => now });
+    assert.equal(await lookup.idFor(TOK_A), 1001);
+    failing = true; // and TOK_A may have been revoked meanwhile: nobody can tell
+    now += 10 * 60_000 + 1_000;
+    const got = [];
+    for (let i = 0; i < 3; i++, now += 1_000) got.push(await lookup.idFor(TOK_A).catch((e) => e.status));
+    assert.deepEqual(got, [503, 503, 503]); // the third finds its account's 2 checks used, and still no id
+    failing = false;
+    now += 61_000;
+    assert.equal(await lookup.idFor(TOK_A), 1001); // AniList answers again
+});
+
 test('ANILIST_URL: AniList itself or a loopback stand-in, nothing else', () => {
     assert.equal(anilistUrl(undefined), 'https://graphql.anilist.co');
     assert.equal(anilistUrl('https://graphql.anilist.co/'), 'https://graphql.anilist.co');

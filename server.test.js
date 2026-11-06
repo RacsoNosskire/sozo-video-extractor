@@ -1,6 +1,6 @@
 // `npm test`. server.js as the image runs it, with Puppeteer and miruro's lookup stubbed through
-// the require cache: /health, CORS before /sync, /miruro/stream's answers and its 504, and which
-// routes log an ignored X-Real-IP. No network, no Chrome.
+// the require cache: /health, CORS ahead of /health, /sync and /proxy, /miruro/stream's answers
+// and its 504, and which routes log an ignored X-Real-IP. No network, no Chrome.
 const test = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
@@ -44,6 +44,7 @@ async function listen(t) {
 }
 
 const FOUND = { videoUrl: 'https://s1.keeply.top/a/pl.m3u8', referer: 'https://www.miruro.tv/', qualities: [], subtitles: [], skips: [], audio: ['sub', 'dub'] };
+const DEV = 'http://localhost:8791'; // the dev web build's origin
 const health = async (base) => (await fetch(`${base}/health`)).json();
 
 test('loading server.js builds the app and listens nowhere', () => {
@@ -62,15 +63,26 @@ test('/health: 200, status ok, never cached, with the lookups and whether sync c
     assert.deepEqual(Object.keys(body.lookups), ['lastOkAt', 'lastFailAt', 'lastError']);
 });
 
-test("CORS: the dev web build's preflight for /sync gets its headers", async (t) => {
+test("CORS: the dev web build's preflight for /sync, and the answers of /health, /sync and /proxy, name its origin", async (t) => {
     const base = await listen(t);
+    t.mock.method(console, 'error', () => {}); // proxy.js's line for the missing url
     const r = await fetch(`${base}/sync`, {
         method: 'OPTIONS',
-        headers: { Origin: 'http://localhost:8791', 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
+        headers: { Origin: DEV, 'Access-Control-Request-Method': 'POST', 'Access-Control-Request-Headers': 'authorization,content-type' },
     });
     assert.equal(r.status, 204);
-    assert.equal(r.headers.get('access-control-allow-origin'), 'http://localhost:8791');
+    assert.equal(r.headers.get('access-control-allow-origin'), DEV);
     assert.match(r.headers.get('access-control-allow-headers'), /\bAuthorization\b/);
+
+    // cors answers a preflight wherever it is mounted; real answers show it runs before the routes.
+    const read = async (route, init = {}) => {
+        const res = await fetch(`${base}${route}`, { ...init, headers: { Origin: DEV, ...init.headers } });
+        return [res.status, res.headers.get('access-control-allow-origin'), await res.text()];
+    };
+    assert.deepEqual((await read('/health')).slice(0, 2), [200, DEV]);
+    const signedOut = await read('/sync', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: '{}' });
+    assert.deepEqual(signedOut, [401, DEV, '{"status":"error","error":"sign-in required"}']);
+    assert.deepEqual(await read('/proxy/sub'), [400, DEV, 'bad url']); // proxy.js's own answer: it is mounted
 });
 
 test('/miruro/stream: what the lookup found, and a request without anilistId', async (t) => {

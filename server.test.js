@@ -46,6 +46,10 @@ async function listen(t) {
 const FOUND = { videoUrl: 'https://s1.keeply.top/a/pl.m3u8', referer: 'https://www.miruro.tv/', qualities: [], subtitles: [], skips: [], audio: ['sub', 'dub'] };
 const DEV = 'http://localhost:8791'; // the dev web build's origin
 const health = async (base) => (await fetch(`${base}/health`)).json();
+// `n` turns of the event loop; setImmediate stays real while setTimeout is mocked.
+const turns = async (n) => {
+    for (let i = 0; i < n; i++) await new Promise((resolve) => setImmediate(resolve));
+};
 
 test('loading server.js builds the app and listens nowhere', () => {
     assert.equal(listens.mock.callCount(), 0);
@@ -102,7 +106,8 @@ test('/miruro/stream: what the lookup found, and a request without anilistId', a
     assert.deepEqual([missing.status, await missing.json()], [400, { status: 'error', error: 'Missing anilistId' }]);
 });
 
-test('/miruro/stream: no answer within 70 s is one 504, and a lookup that ends later is still noted', async (t) => {
+// With a timer past 70 s the fetch would wait for ever: the timeout fails it instead.
+test('/miruro/stream: no answer within 70 s is one 504, and a lookup that ends later is still noted', { timeout: 10_000 }, async (t) => {
     const base = await listen(t);
     const note = t.mock.method(miruro.lookups, 'note');
     const errors = t.mock.method(console, 'error', () => {});
@@ -116,7 +121,10 @@ test('/miruro/stream: no answer within 70 s is one 504, and a lookup that ends l
     t.mock.timers.enable({ apis: ['setTimeout'] });
     const reply = fetch(`${base}/miruro/stream?anilistId=21&ep=1`);
     await called;
-    t.mock.timers.tick(70_000);
+    t.mock.timers.tick(69_999); // 1 ms short: nothing yet, though an answer sent reaches fetch within 2 turns
+    assert.equal(await Promise.race([reply, turns(20).then(() => 'none yet')]), 'none yet');
+    assert.equal(note.mock.callCount(), 0);
+    t.mock.timers.tick(1);
     const r = await reply;
     assert.equal(r.status, 504);
     assert.deepEqual(await r.json(), { status: 'error', error: 'Extractor timeout', reason: 'timeout' });

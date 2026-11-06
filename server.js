@@ -385,12 +385,17 @@ app.get('/health', (req, res) => {
     res.json({ status: 'ok', uptime: process.uptime(), now: Date.now(), lookups: lookups.snapshot(), sync: sync.ready ? 'ok' : 'off' });
 });
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Sozo Video Extractor running on port ${PORT}`);
-    if (process.env.TRUSTED_PROXIES) console.log(`[TRUST] X-Real-IP is believed from ${process.env.TRUSTED_PROXIES}`);
-});
+module.exports = { app };
 
-process.on('SIGTERM', async () => {
-    if (browser) await browser.close();
-    process.exit(0);
-});
+// Listens only when node runs this file (npm start, the image's CMD), not when a test loads it.
+if (require.main === module) {
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Sozo Video Extractor running on port ${PORT}`);
+        if (process.env.TRUSTED_PROXIES) console.log(`[TRUST] X-Real-IP is believed from ${process.env.TRUSTED_PROXIES}`);
+    });
+
+    process.on('SIGTERM', async () => {
+        if (browser) await browser.close();
+        process.exit(0);
+    });
+}

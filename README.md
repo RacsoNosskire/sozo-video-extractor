@@ -20,6 +20,12 @@ npm start            # port 3232 (PORT overrides)
 npm test             # node --test: no network, no Chrome
 ```
 
+`server.js` listens only when node runs it (`npm start`, the image's `CMD`); `require('./server')`
+gives `{ app }` and listens nowhere. `server.test.js` loads it that way, with Puppeteer and the
+Miruro lookup stubbed, for `/health`, CORS and `/miruro/stream` (its 504 too), and
+`dockerfile.test.js` checks that the image copies every module `server.js` loads and runs
+`node server.js`.
+
 Environment:
 
 | Variable | Default | What |

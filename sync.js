@@ -317,7 +317,12 @@ function unavailable(what, e) {
 function allowList(value) {
     if (value === undefined || value === null || value === '') return null;
     const items = Array.isArray(value) ? value : String(value).split(',');
-    const ids = items.map((s) => Number(String(s).trim())).filter((n) => isInt(n, 1, MAX_ID));
+    const ids = [];
+    for (const item of items.map((s) => String(s).trim()).filter(Boolean)) {
+        const n = Number(item);
+        if (isInt(n, 1, MAX_ID)) ids.push(n);
+        else console.error(`[SYNC] SYNC_USERS: "${item}" is not an account id, ignored`);
+    }
     if (!ids.length) console.error('[SYNC] SYNC_USERS names no account id, so no account can sync');
     return new Set(ids);
 }
@@ -401,7 +406,8 @@ function mount(app, opts = {}) {
     }
     if (ready) {
         removeUnfinished(dir);
-        console.log(`[SYNC] accounts in ${dir}: ${allow ? `only ${[...allow].join(', ')}` : `any AniList account, up to ${maxUsers}`}`);
+        const who = !allow ? `any AniList account, up to ${maxUsers}` : allow.size ? `only ${[...allow].join(', ')}` : 'none (SYNC_USERS names no valid id)';
+        console.log(`[SYNC] accounts in ${dir}: ${who}`);
     }
 
     const file = (user) => path.join(dir, `${user}.json`);

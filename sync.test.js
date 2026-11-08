@@ -607,6 +607,20 @@ test('/sync: storage that fails says what in the log, and the reply names no fil
     assert.deepEqual(errors.mock.calls.map((c) => c.arguments.join(' ')), ["[SYNC] 1001: can't read 1001.json (EISDIR)"]);
 });
 
+test('/sync: SYNC_USERS names each item that is not an account id, and says when none is left', async (t) => {
+    const anilist = await standIn(t);
+    const errors = t.mock.method(console, 'error', () => {});
+    const logs = t.mock.method(console, 'log', () => {});
+    const lines = (m) => m.mock.calls.map((c) => c.arguments.join(' '));
+    const some = await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, allow: '1001, 3003x,' });
+    assert.deepEqual(lines(errors), ['[SYNC] SYNC_USERS: "3003x" is not an account id, ignored']);
+    assert.match(lines(logs).at(-1), /: only 1001$/);
+    assert.equal((await call(some.base, TOK_A, ask(1001, '', 0))).status, 200);
+    await syncServer(t, { dir: tempDir(t), anilistUrl: anilist.url, allow: 'abc' });
+    assert.deepEqual(lines(errors).slice(1), ['[SYNC] SYNC_USERS: "abc" is not an account id, ignored', '[SYNC] SYNC_USERS names no account id, so no account can sync']);
+    assert.match(lines(logs).at(-1), /: none \(SYNC_USERS names no valid id\)$/);
+});
+
 test('/sync: an unreadable account file is set aside and started again', async (t) => {
     const anilist = await standIn(t);
     const dir = tempDir(t);

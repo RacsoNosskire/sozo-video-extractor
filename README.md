@@ -200,6 +200,14 @@ What to do at ship time (with the user's go), in this order:
    address is the nginx as this server sees it (a Docker bridge address such as 172.18.0.1). Put it
    in `TRUSTED_PROXIES` in the compose environment and redeploy. Never a range the LAN's own devices
    use: they could then write any `X-Real-IP`.
+   First check Traefik: the site's nginx takes the client address from `X-Forwarded-For` sent by
+   any 10/8, 172.16/12 or 192.168/16 address (`set_real_ip_from` in `web-deploy/nginx.conf`) and
+   passes it on as `X-Real-IP`. That is only the visitor's own address while Traefik replaces the
+   header, its default. In Traefik's static config, the entry point the site uses must not have
+   `forwardedHeaders.insecure: true`, and its `forwardedHeaders.trustedIPs` must not cover the LAN;
+   and the site container must not be reachable from the LAN except through Traefik. Otherwise a
+   LAN device could pick its own `X-Real-IP` and get round the per-client limits on `/x/sync` and
+   `/x/auth/*` (the global cap on AniList lookups still holds): leave `TRUSTED_PROXIES` unset.
 5. Never set `ANILIST_URL` there: it is refused for anything but AniList and loopback anyway.
 
 Without a volume nothing is lost either: each redeploy would start an empty copy with a new epoch,

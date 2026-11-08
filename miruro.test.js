@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const miruro = require('./miruro');
 
-const { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, firstPlayable, lookups } = miruro;
+const { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, lookups } = miruro;
 
 const provider = (name, streams, extra = {}) => ({
     provider: name,
@@ -46,7 +46,7 @@ const catalog = (anilistId, play) => fakeBrowser((path) => {
     if (path === `/api/v1/anime/m${anilistId}/episodes/1/play`) return play;
     return { status: 404, error: 'not found' };
 });
-const plays = { isPlaylist: async () => true, hasCues: async () => true };
+const plays = { isPlaylist: async () => true };
 
 test('audioOf: the versions with an HLS stream', () => {
     assert.deepEqual(audioOf(BOTH), ['sub', 'dub']);
@@ -133,56 +133,4 @@ test('lookups keep times and an error word only', () => {
     assert.equal(s.lastError, 'source_down');
     lookups.note(false, 'Something /secret/ happened');
     assert.equal(lookups.snapshot().lastError, 'error');
-});
-
-// Candidates as pickCandidates makes them, for two providers' subtitles.
-const KEY = 'a54d389c18527d9fd3e7f0643e27edbe';
-const cand = (provider, subFile) => ({
-    track: 'ssub', provider, server: { server: `${provider}-1`, headers: {} }, stream: hls(`https://cdn.example/${provider}.m3u8`),
-    subtitles: subFile ? [{ file: subFile, format: 'vtt', label: 'English', language: 'en', default: true }] : [], skips: [],
-});
-const BASES = ['https://p1.example/', 'https://p2.example/'];
-const plays1 = async () => true;
-
-test('firstPlayable: a provider whose subtitles do not load gives way to one whose do', async () => {
-    const asked = [];
-    const cues = async (url) => { asked.push(url); return !url.includes(BASES[0]) || asked.length > 1; };
-    const r = await firstPlayable([cand('a', 'https://dead.example/a.vtt'), cand('b', 'https://ok.example/b.vtt')], BASES, KEY, plays1, cues);
-    assert.ok(r.url.startsWith(BASES[0]));
-    assert.equal(asked.length, 2, "each provider's first subtitle is fetched once");
-    assert.equal(r.subtitles[0].url, asked[1]);
-});
-
-test("firstPlayable: when no provider's subtitles load, the first playable one is the answer", async () => {
-    let n = 0;
-    const r = await firstPlayable([cand('a', 'https://dead.example/a.vtt'), cand('b', 'https://dead.example/b.vtt')], BASES, KEY, plays1, async () => { n += 1; return false; });
-    assert.equal(n, 2);
-    assert.equal(r.subtitles.length, 1);
-    assert.ok(r.url.includes('p1.example'));
-    const first = await firstPlayable([cand('a', 'https://dead.example/a.vtt')], BASES, KEY, plays1, async () => false);
-    assert.equal(r.url, first.url, 'the same candidate as without the others');
-});
-
-test('firstPlayable: servers sharing dead subtitles are not fetched again, and subtitle-less ones do not win', async () => {
-    let n = 0;
-    const cues = async () => { n += 1; return false; };
-    const same = [cand('a', 'https://dead.example/a.vtt'), { ...cand('a', 'https://dead.example/a.vtt'), server: { server: 'a-2', headers: {} } }, cand('c', null)];
-    const r = await firstPlayable(same, BASES, KEY, plays1, cues);
-    assert.equal(n, 1);
-    assert.equal(r.subtitles.length, 1, 'the provider with (dead) subtitles, not the one without');
-});
-
-test('firstPlayable: a stream without subtitles is taken at once, with no subtitle fetch', async () => {
-    let n = 0;
-    const r = await firstPlayable([cand('a', null)], BASES, KEY, plays1, async () => { n += 1; return true; });
-    assert.equal(n, 0);
-    assert.deepEqual(r.subtitles, []);
-});
-
-test("firstPlayable: at most SUBTITLE_TRIES providers' subtitles are fetched", async () => {
-    let n = 0;
-    const many = ['a', 'b', 'c', 'd', 'e'].map(p => cand(p, `https://dead.example/${p}.vtt`));
-    const r = await firstPlayable(many, BASES, KEY, plays1, async () => { n += 1; return false; });
-    assert.equal(n, 3);
-    assert.ok(r.url.includes('p1.example'));
 });

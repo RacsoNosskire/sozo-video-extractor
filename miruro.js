@@ -133,9 +133,34 @@ async function isPlaylist(url) {
   }
 }
 
-// The first candidate one of the proxies serves a playlist for, or null.
-async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist) {
+// A subtitle file that loads: a WebVTT or SRT body with at least one cue.
+async function hasCues(url) {
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+    return r.ok && (await r.text()).includes('-->');
+  } catch {
+    return false;
+  }
+}
+
+// How many providers' subtitles firstPlayable tries before it settles for one whose don't load.
+const SUBTITLE_TRIES = 3;
+
+// The first candidate one of the proxies serves a playlist for whose subtitles load (its first,
+// usually the default English, is fetched once), or null. Subtitles belong to a provider and some
+// providers' files are gone upstream (the proxy answers 500), so a playable candidate with dead
+// subtitles is kept back while up to SUBTITLE_TRIES providers' are tried; if none load, the first
+// playable candidate is the answer, as before.
+async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist, cues = hasCues) {
+  let fallback = null;
+  const triedSubs = new Map(); // first subtitle file -> whether it loaded
   for (const c of candidates) {
+    const subFiles = c.subtitles
+      .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
+      .sort((a, b) => (b.default === true) - (a.default === true));
+    const firstSub = subFiles[0];
+    if (fallback && firstSub && triedSubs.get(firstSub.file) === false) continue;
+    if (fallback && triedSubs.size >= SUBTITLE_TRIES && !triedSubs.has(firstSub && firstSub.file)) break;
     const upstreamReferer = (c.server.headers && (c.server.headers.Referer || c.server.headers.referer)) || '';
     for (const base of proxyBases) {
       const m3u8 = proxyUrl(base, 'pl.m3u8', c.stream.url, upstreamReferer, obfKey);
@@ -145,17 +170,27 @@ async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist)
       }
       console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} m3u8 ${m3u8.slice(0, 90)}`);
 
-      const subtitles = c.subtitles
-        .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
-        .sort((a, b) => (b.default === true) - (a.default === true))
-        .map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
+      const subtitles = subFiles.map(s => ({ url: proxyUrl(base, 'sub.vtt', s.file, upstreamReferer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
 
       // The proxy itself needs no headers; keep the historical Referer so
       // clients that always send one behave exactly as before.
-      return { url: m3u8, referer: `${MIRURO_HOST}/`, qualities: [], subtitles, skips: c.skips };
+      const found = { url: m3u8, referer: `${MIRURO_HOST}/`, qualities: [], subtitles, skips: c.skips };
+      if (!subtitles.length) {
+        if (!fallback) return found;
+        break; // no better than the one kept back
+      }
+      let loads = triedSubs.get(firstSub.file);
+      if (loads === undefined) {
+        loads = await cues(subtitles[0].url);
+        triedSubs.set(firstSub.file, loads);
+      }
+      if (loads) return found;
+      console.log(`[MIRURO] ${c.track}/${c.provider}/${c.server.server} subtitles don't load`);
+      if (!fallback) fallback = found;
+      break; // this candidate plays; the next proxy would serve the same dead files
     }
   }
-  return null;
+  return fallback;
 }
 
 const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qualities || [], subtitles: s.subtitles || [], skips: s.skips || [] });
@@ -166,7 +201,8 @@ const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qua
  * @param {string|number} anilistId
  * @param {number} ep 1-based episode number
  * @param {string} type 'sub' | 'dub'
- * @param {{isPlaylist?: (url: string) => Promise<boolean>}} [seams] tests replace the playlist check
+ * @param {{isPlaylist?: (url: string) => Promise<boolean>, hasCues?: (url: string) => Promise<boolean>}} [seams]
+ *   tests replace the playlist and subtitle checks
  * @returns {Promise<object|null>} one of
  *   {videoUrl, referer, qualities, subtitles, skips, audio}: found; audio lists the versions it has;
  *   {missing: true, audio, fallback}: the episode is there, not in this version; fallback is the
@@ -174,7 +210,7 @@ const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qua
  *   {sourceDown: true}: miruro's catalog, its play call or its proxies didn't answer;
  *   null: not in the catalog, or no such episode.
  */
-async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPlaylist: check = isPlaylist } = {}) {
+async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPlaylist: check = isPlaylist, hasCues: cues = hasCues } = {}) {
   const key = `${anilistId}:${ep}:${type}`;
   const cached = getCached(key);
   if (cached) {
@@ -241,12 +277,12 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPla
     if (!audio.includes(type)) {
       const other = audio[0];
       console.log(`[MIRURO] no ${type} for ep ${ep} (has ${audio.join(',')})`);
-      const found = await firstPlayable(pickCandidates(play.json, other), proxyBases, obfKey, check);
+      const found = await firstPlayable(pickCandidates(play.json, other), proxyBases, obfKey, check, cues);
       if (found) keep(other, found);
       return { missing: true, audio, fallback: found ? { type: other, ...streamOf(found) } : null };
     }
 
-    const found = await firstPlayable(pickCandidates(play.json, type), proxyBases, obfKey, check);
+    const found = await firstPlayable(pickCandidates(play.json, type), proxyBases, obfKey, check, cues);
     if (!found) {
       console.log('[MIRURO] no candidate stream served a playlist');
       return { sourceDown: true };
@@ -284,4 +320,4 @@ function streamAnswer(result, type) {
   return { status: 404, ok: true, body: { status: 'error', error: 'No stream found', reason: 'not_found' } };
 }
 
-module.exports = { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, lookups };
+module.exports = { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, firstPlayable, lookups };

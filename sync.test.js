@@ -597,6 +597,16 @@ test('/sync: storage that cannot be used, the account cap and the allowlist', as
     assert.equal((await call(only.base, TOK_A, ask(1001, '', 0))).status, 200);
 });
 
+test('/sync: storage that fails says what in the log, and the reply names no file', async (t) => {
+    const anilist = await standIn(t);
+    const dir = tempDir(t);
+    fs.mkdirSync(path.join(dir, '1001.json'));
+    const { base } = await syncServer(t, { dir, anilistUrl: anilist.url });
+    const errors = t.mock.method(console, 'error', () => {});
+    assert.deepEqual(await call(base, TOK_A, ask(1001, '', 0)).then((r) => [r.status, r.body]), [500, { status: 'error', error: 'storage unavailable' }]);
+    assert.deepEqual(errors.mock.calls.map((c) => c.arguments.join(' ')), ["[SYNC] 1001: can't read 1001.json (EISDIR)"]);
+});
+
 test('/sync: an unreadable account file is set aside and started again', async (t) => {
     const anilist = await standIn(t);
     const dir = tempDir(t);

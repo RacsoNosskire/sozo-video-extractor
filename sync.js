@@ -307,6 +307,12 @@ function viewerLookup({ url = ANILIST, fetchImpl = fetch, now = Date.now, allow 
     };
 }
 
+// A 500 for storage that failed, said in the log first: the reply names no file.
+function unavailable(what, e) {
+    console.error(`[SYNC] ${what} (${e.code || e.message})`);
+    return new HttpError(500, 'storage unavailable');
+}
+
 // SYNC_USERS="1001,2002": only these accounts sync; unset lets any account AniList vouches for.
 function allowList(value) {
     if (value === undefined || value === null || value === '') return null;
@@ -420,12 +426,12 @@ function mount(app, opts = {}) {
         try {
             raw = await fs.promises.readFile(file(user), 'utf8');
         } catch (e) {
-            if (e.code !== 'ENOENT') throw new HttpError(500, 'storage unavailable');
+            if (e.code !== 'ENOENT') throw unavailable(`${user}: can't read ${path.basename(file(user))}`, e);
             let names;
             try {
                 names = await fs.promises.readdir(dir);
-            } catch {
-                throw new HttpError(500, 'storage unavailable');
+            } catch (e) {
+                throw unavailable(`${user}: can't list ${dir}`, e);
             }
             if (names.filter((n) => ACCOUNT_FILE.test(n)).length + creating.size >= maxUsers) throw new HttpError(403, 'sync is full');
             creating.add(user);
@@ -438,8 +444,8 @@ function mount(app, opts = {}) {
         const bad = `${file(user)}.bad-${now()}`;
         try {
             await fs.promises.rename(file(user), bad);
-        } catch {
-            throw new HttpError(500, 'storage unavailable');
+        } catch (e) {
+            throw unavailable(`${user}: can't set aside ${path.basename(file(user))}`, e);
         }
         console.error(`[SYNC] ${user}: the file didn't read, kept as ${path.basename(bad)}; starting again`);
         return { doc: emptyDoc(user), fresh: true };

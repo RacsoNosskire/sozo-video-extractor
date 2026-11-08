@@ -3,7 +3,7 @@ const test = require('node:test');
 const assert = require('node:assert');
 const miruro = require('./miruro');
 
-const { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, lookups } = miruro;
+const { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, borrowSubtitles, lookups } = miruro;
 
 const provider = (name, streams, extra = {}) => ({
     provider: name,
@@ -46,7 +46,64 @@ const catalog = (anilistId, play) => fakeBrowser((path) => {
     if (path === `/api/v1/anime/m${anilistId}/episodes/1/play`) return play;
     return { status: 404, error: 'not found' };
 });
-const plays = { isPlaylist: async () => true };
+const plays = { isPlaylist: async () => true, hasCues: async () => true, playlistSeconds: async () => 1420 };
+
+// For borrowSubtitles: the stream found (from provider `a`, through p1) and the other candidates.
+const KEY = 'a54d389c18527d9fd3e7f0643e27edbe';
+const BASE = 'https://p1.example/';
+const deadSub = { url: 'https://p1.example/dead/sub.vtt', lang: 'English', language: 'en' };
+const foundA = { url: 'https://p1.example/a/pl.m3u8', referer: 'https://www.miruro.tv/', qualities: [], subtitles: [deadSub], skips: [], provider: 'a', base: BASE };
+const cand = (provider, subFile) => ({
+    track: 'ssub', provider, server: { server: `${provider}-1`, headers: {} }, stream: hls(`https://cdn.example/${provider}.m3u8`),
+    subtitles: subFile ? [{ file: subFile, format: 'vtt', label: 'English', language: 'eng', default: true }] : [], skips: [],
+});
+// Subtitles load unless they're the found stream's own. The found stream is 1420 s; the others
+// asked about are, in the order asked, `others` (1420 s each when it runs out).
+const seams = (others = []) => {
+    const asked = { cues: [], seconds: [] };
+    return {
+        asked,
+        cues: async (url) => { asked.cues.push(url); return url !== deadSub.url; },
+        seconds: async (url) => { asked.seconds.push(url); return url === foundA.url ? 1420 : (others.length ? others.shift() : 1420); },
+    };
+};
+
+test('borrowSubtitles: dead subtitles are taken from another provider as long as the stream; the video stays', async () => {
+    const s = seams();
+    const r = await borrowSubtitles(foundA, [cand('a', 'https://cdn.example/a.vtt'), cand('b', 'https://cdn.example/b.vtt')], KEY, s);
+    assert.equal(r.url, foundA.url);
+    assert.equal(r.subtitles.length, 1);
+    assert.notEqual(r.subtitles[0].url, deadSub.url);
+    assert.ok(r.subtitles[0].url.startsWith(BASE));
+    assert.equal(r.subtitles[0].language, 'eng');
+});
+
+test('borrowSubtitles: subtitles that load, or none at all, are left as they are and nothing else is asked', async () => {
+    const s = seams();
+    const ok = { ...foundA, subtitles: [{ ...deadSub, url: 'https://p1.example/ok/sub.vtt' }] };
+    assert.equal(await borrowSubtitles(ok, [cand('b', 'https://cdn.example/b.vtt')], KEY, s), ok);
+    const none = { ...foundA, subtitles: [] };
+    assert.equal(await borrowSubtitles(none, [cand('b', 'https://cdn.example/b.vtt')], KEY, s), none);
+    assert.equal(s.asked.seconds.length, 0);
+});
+
+test('borrowSubtitles: a provider whose episode is another length is passed over', async () => {
+    const s = seams([1500, 1419.2]);
+    const r = await borrowSubtitles(foundA, [cand('b', 'https://cdn.example/b.vtt'), cand('c', 'https://cdn.example/c.vtt')], KEY, s);
+    assert.notEqual(r.subtitles[0].url, deadSub.url);
+    assert.equal(s.asked.seconds.length, 3, 'own, b (too long), c (0.8 s off: taken)');
+    const none = await borrowSubtitles(foundA, [cand('b', 'https://cdn.example/b.vtt')], KEY, seams([1430]));
+    assert.equal(none, foundA);
+});
+
+test('borrowSubtitles: an unknown own length borrows nothing; providers without subtitles are skipped; at most 3 tried', async () => {
+    const unknown = { cues: async () => false, seconds: async () => null };
+    assert.equal(await borrowSubtitles(foundA, [cand('b', 'https://cdn.example/b.vtt')], KEY, unknown), foundA);
+    const s = seams([1, 2, 3, 4, 5]);
+    const many = [cand('x', null), ...['b', 'c', 'd', 'e', 'f'].map(p => cand(p, `https://cdn.example/${p}.vtt`))];
+    assert.equal(await borrowSubtitles(foundA, many, KEY, s), foundA);
+    assert.equal(s.asked.seconds.length, 4, 'own and three providers');
+});
 
 test('audioOf: the versions with an HLS stream', () => {
     assert.deepEqual(audioOf(BOTH), ['sub', 'dub']);

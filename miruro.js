@@ -133,6 +133,73 @@ async function isPlaylist(url) {
   }
 }
 
+// A subtitle file that loads: a WebVTT or SRT body with at least one cue.
+async function hasCues(url) {
+  try {
+    const r = await fetch(url, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+    return r.ok && (await r.text()).includes('-->');
+  } catch {
+    return false;
+  }
+}
+
+// The length in seconds of an HLS stream (its first variant's EXTINFs), or null.
+async function playlistSeconds(url) {
+  const get = async (u) => {
+    const r = await fetch(u, { headers: { 'User-Agent': UA }, signal: AbortSignal.timeout(10000) });
+    return r.ok ? r.text() : '';
+  };
+  try {
+    let text = await get(url);
+    if (text.includes('#EXT-X-STREAM-INF')) {
+      const variant = text.split(/\r?\n/).find(l => l.trim() && !l.startsWith('#'));
+      if (!variant) return null;
+      text = await get(new URL(variant.trim(), url).href);
+    }
+    const parts = [...text.matchAll(/#EXTINF:([0-9.]+)/g)].map(m => Number(m[1]));
+    return parts.length ? parts.reduce((a, b) => a + b, 0) : null;
+  } catch {
+    return null;
+  }
+}
+
+// How many other providers' subtitles borrowSubtitles tries, and how far their episode's length may
+// be from the one playing (a longer gap is another cut, whose subtitles would be out of time).
+const BORROW_TRIES = 3;
+const SAME_LENGTH_S = 1.5;
+
+// `found`'s subtitles when they load; when they don't (some providers' files are gone upstream:
+// 403 there, 500 from the proxy), another provider's for the same episode whose stream is as long
+// as this one's and whose files load. The video stays the one found: other providers can be far
+// slower. Without such a provider, `found` as it is.
+async function borrowSubtitles(found, candidates, obfKey, { cues = hasCues, seconds = playlistSeconds } = {}) {
+  if (!found.subtitles.length || (await cues(found.subtitles[0].url))) return found;
+  console.log(`[MIRURO] ${found.provider} subtitles don't load`);
+  const own = await seconds(found.url);
+  if (!own) return found;
+  const tried = new Set();
+  for (const c of candidates) {
+    if (c.provider === found.provider || tried.has(c.provider)) continue;
+    const files = c.subtitles
+      .filter(s => s.file && (s.format === 'vtt' || s.format === 'srt'))
+      .sort((a, b) => (b.default === true) - (a.default === true));
+    if (!files.length) continue;
+    if (tried.size >= BORROW_TRIES) break;
+    tried.add(c.provider);
+    const referer = (c.server.headers && (c.server.headers.Referer || c.server.headers.referer)) || '';
+    const length = await seconds(proxyUrl(found.base, 'pl.m3u8', c.stream.url, referer, obfKey));
+    if (!length || Math.abs(length - own) > SAME_LENGTH_S) {
+      console.log(`[MIRURO] ${c.provider} is ${length ? `${length.toFixed(1)} s, not ${own.toFixed(1)} s` : 'of unknown length'}: its subtitles aren't used`);
+      continue;
+    }
+    const subtitles = files.map(s => ({ url: proxyUrl(found.base, 'sub.vtt', s.file, referer, obfKey), lang: s.label || s.language || 'English', language: s.language || null }));
+    if (!(await cues(subtitles[0].url))) continue;
+    console.log(`[MIRURO] subtitles from ${c.provider} (${length.toFixed(1)} s, as the stream)`);
+    return { ...found, subtitles };
+  }
+  return found;
+}
+
 // The first candidate one of the proxies serves a playlist for, or null.
 async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist) {
   for (const c of candidates) {
@@ -152,7 +219,7 @@ async function firstPlayable(candidates, proxyBases, obfKey, check = isPlaylist)
 
       // The proxy itself needs no headers; keep the historical Referer so
       // clients that always send one behave exactly as before.
-      return { url: m3u8, referer: `${MIRURO_HOST}/`, qualities: [], subtitles, skips: c.skips };
+      return { url: m3u8, referer: `${MIRURO_HOST}/`, qualities: [], subtitles, skips: c.skips, provider: c.provider, base };
     }
   }
   return null;
@@ -166,7 +233,8 @@ const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qua
  * @param {string|number} anilistId
  * @param {number} ep 1-based episode number
  * @param {string} type 'sub' | 'dub'
- * @param {{isPlaylist?: (url: string) => Promise<boolean>}} [seams] tests replace the playlist check
+ * @param {{isPlaylist?: (url: string) => Promise<boolean>, hasCues?: (url: string) => Promise<boolean>,
+ *   playlistSeconds?: (url: string) => Promise<number|null>}} [seams] tests replace the network checks
  * @returns {Promise<object|null>} one of
  *   {videoUrl, referer, qualities, subtitles, skips, audio}: found; audio lists the versions it has;
  *   {missing: true, audio, fallback}: the episode is there, not in this version; fallback is the
@@ -174,7 +242,7 @@ const streamOf = (s) => ({ videoUrl: s.url, referer: s.referer, qualities: s.qua
  *   {sourceDown: true}: miruro's catalog, its play call or its proxies didn't answer;
  *   null: not in the catalog, or no such episode.
  */
-async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPlaylist: check = isPlaylist } = {}) {
+async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPlaylist: check = isPlaylist, hasCues: cues = hasCues, playlistSeconds: seconds = playlistSeconds } = {}) {
   const key = `${anilistId}:${ep}:${type}`;
   const cached = getCached(key);
   if (cached) {
@@ -241,12 +309,16 @@ async function resolveMiruroStream(browser, anilistId, ep, type = 'sub', { isPla
     if (!audio.includes(type)) {
       const other = audio[0];
       console.log(`[MIRURO] no ${type} for ep ${ep} (has ${audio.join(',')})`);
-      const found = await firstPlayable(pickCandidates(play.json, other), proxyBases, obfKey, check);
+      const candidates = pickCandidates(play.json, other);
+      const first = await firstPlayable(candidates, proxyBases, obfKey, check);
+      const found = first && (await borrowSubtitles(first, candidates, obfKey, { cues, seconds }));
       if (found) keep(other, found);
       return { missing: true, audio, fallback: found ? { type: other, ...streamOf(found) } : null };
     }
 
-    const found = await firstPlayable(pickCandidates(play.json, type), proxyBases, obfKey, check);
+    const candidates = pickCandidates(play.json, type);
+    const first = await firstPlayable(candidates, proxyBases, obfKey, check);
+    const found = first && (await borrowSubtitles(first, candidates, obfKey, { cues, seconds }));
     if (!found) {
       console.log('[MIRURO] no candidate stream served a playlist');
       return { sourceDown: true };
@@ -284,4 +356,4 @@ function streamAnswer(result, type) {
   return { status: 404, ok: true, body: { status: 'error', error: 'No stream found', reason: 'not_found' } };
 }
 
-module.exports = { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, lookups };
+module.exports = { resolveMiruroStream, streamAnswer, audioOf, pickCandidates, borrowSubtitles, lookups };

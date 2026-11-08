@@ -336,10 +336,12 @@ app.get('/animepahe/video', async (req, res) => {
     }
 });
 
-require('./pairing').mount(app);
+// TRUSTED_PROXIES, read once for every rate limit.
+const trusted = require('./pairing').trustedProxies();
+require('./pairing').mount(app, { trusted });
 
 // Continue on any device: progress, Saved and Continue Watching per AniList account.
-const sync = require('./sync').mount(app);
+const sync = require('./sync').mount(app, { trusted });
 
 // ── Miruro (AniList-native, browser-driven) ─────────────────────────
 const { resolveMiruroStream, streamAnswer, lookups } = require('./miruro');

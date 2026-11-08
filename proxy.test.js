@@ -196,6 +196,12 @@ test('X-Real-IP counts only from a trusted proxy', () => {
     assert.equal(list.check('8.8.8.8', 'ipv4'), false);
 });
 
+test('pairing: a bad TRUSTED_PROXIES item is logged once, however many limits use the list', (t) => {
+    const errors = t.mock.method(console, 'error', () => {});
+    pairing.mount(express(), { trusted: '10.0.0.0/8, nonsense' });
+    assert.deepEqual(errors.mock.calls.map((c) => c.arguments.join(' ')), ['[TRUST] TRUSTED_PROXIES: "nonsense" is not an address or range, ignored']);
+});
+
 test('login page keeps hostile strings out of the script', () => {
     const page = pairing.loginPage('ABCD2345', 'https://x/"</script><img>');
     assert.ok(!page.includes('</script><img>'));

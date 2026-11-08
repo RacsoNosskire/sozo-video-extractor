@@ -171,7 +171,9 @@ function sendToken() {
 
 // `trusted`: the proxies whose X-Real-IP counts (see trustedProxies).
 function mount(app, { trusted } = {}) {
-    const limit = (n) => rateLimit(n, 60_000, { trusted });
+    // Read once: each limiter would log the same bad TRUSTED_PROXIES items again.
+    const proxies = trustedProxies(trusted);
+    const limit = (n) => rateLimit(n, 60_000, { trusted: proxies });
     // code → { secret, token, createdAt }
     const sessions = new Map();
     const live = (code) => {

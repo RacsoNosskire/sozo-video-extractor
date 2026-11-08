@@ -393,7 +393,7 @@ module.exports = { app };
 if (require.main === module) {
     app.listen(PORT, '0.0.0.0', () => {
         console.log(`Sozo Video Extractor running on port ${PORT}`);
-        if (process.env.TRUSTED_PROXIES) console.log(`[TRUST] X-Real-IP is believed from ${process.env.TRUSTED_PROXIES}`);
+        if (process.env.TRUSTED_PROXIES) console.log(require('./pairing').trustLine(trusted));
     });
 
     process.on('SIGTERM', async () => {

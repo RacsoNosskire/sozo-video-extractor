@@ -202,6 +202,13 @@ test('pairing: a bad TRUSTED_PROXIES item is logged once, however many limits us
     assert.deepEqual(errors.mock.calls.map((c) => c.arguments.join(' ')), ['[TRUST] TRUSTED_PROXIES: "nonsense" is not an address or range, ignored']);
 });
 
+test('pairing: the start log names only the TRUSTED_PROXIES items that were taken', (t) => {
+    t.mock.method(console, 'error', () => {});
+    assert.deepEqual(pairing.trustedProxies('a, 10.0.0.1, ::1/129').accepted, ['10.0.0.1']);
+    assert.equal(pairing.trustLine(pairing.trustedProxies('10.0.0.1, 127.0.0.0/8, bogus, ::1/129')), '[TRUST] X-Real-IP is believed from 10.0.0.1, 127.0.0.0/8');
+    assert.equal(pairing.trustLine(pairing.trustedProxies('bogus')), '[TRUST] TRUSTED_PROXIES names no valid address; X-Real-IP is believed from nobody');
+});
+
 test('login page keeps hostile strings out of the script', () => {
     const page = pairing.loginPage('ABCD2345', 'https://x/"</script><img>');
     assert.ok(!page.includes('</script><img>'));

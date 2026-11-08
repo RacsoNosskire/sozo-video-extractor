@@ -30,6 +30,8 @@ function sameSecret(a, b) {
 function trustedProxies(spec = process.env.TRUSTED_PROXIES) {
     if (spec instanceof net.BlockList) return spec;
     const list = new net.BlockList();
+    // What was taken, as written, for the start log (`trustLine`).
+    list.accepted = [];
     const items = Array.isArray(spec) ? spec : String(spec || '').split(',');
     for (const item of items.map((s) => String(s).trim()).filter(Boolean)) {
         const [addr, bits, extra] = item.split('/');
@@ -39,11 +41,21 @@ function trustedProxies(spec = process.env.TRUSTED_PROXIES) {
             console.error(`[TRUST] TRUSTED_PROXIES: "${item}" is not an address or range, ignored`);
         } else if (prefix === null) {
             list.addAddress(addr, type);
+            list.accepted.push(item);
         } else {
             list.addSubnet(addr, prefix, type);
+            list.accepted.push(item);
         }
     }
     return list;
+}
+
+// The start log's line for a TRUSTED_PROXIES list: only the items it took.
+function trustLine(list) {
+    const accepted = list.accepted || [];
+    return accepted.length
+        ? `[TRUST] X-Real-IP is believed from ${accepted.join(', ')}`
+        : '[TRUST] TRUSTED_PROXIES names no valid address; X-Real-IP is believed from nobody';
 }
 
 const unmapped = (ip) => (ip.startsWith('::ffff:') && net.isIPv4(ip.slice(7)) ? ip.slice(7) : ip);
@@ -237,4 +249,4 @@ function mount(app, { trusted } = {}) {
     });
 }
 
-module.exports = { mount, rateLimit, trustedProxies, clientAddress, loginPage, generateCode, generateSecret };
+module.exports = { mount, rateLimit, trustedProxies, trustLine, clientAddress, loginPage, generateCode, generateSecret };
